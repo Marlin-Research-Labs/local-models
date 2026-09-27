@@ -1,0 +1,375 @@
+#!/bin/bash
+# install-claude-local.sh: install claude-local (Claude Code on a local open-weight model).
+# Automates INSTALL.md. No admin rights needed, and it never uses sudo. It is safe to
+# re-run: finished steps are skipped, and existing configs are merged rather than replaced.
+#
+# Usage: ./install-claude-local.sh [--no-verify] [--memory-test] [--force] [--help]
+#   --no-verify    install only; don't start the server or run the checks
+#   --memory-test  also run the full-context memory test (1-2 minutes, ~27 GB)
+#   --force        continue on a Mac that looks too small for this model
+
+set -euo pipefail
+
+OMLX_TAG="v0.7.0rc1"
+MODEL_REPO="unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit"
+MODEL_DIR_NAME="Qwen3.6-35B-A3B-UD-MLX-4bit"
+MODEL_ALIAS="qwen3.6-35b-a3b"
+PORT=8765
+
+APP="$HOME/Applications/oMLX.app"
+OMLX_CLI="$APP/Contents/MacOS/omlx-cli"
+OMLX_PY_ROOT="$APP/Contents/Resources/Python"
+OMLX_HOME="$HOME/.omlx"
+MODEL_DIR="$OMLX_HOME/models/$MODEL_DIR_NAME"
+PROFILE="$HOME/.claude-local"
+WRAPPER="$HOME/.local/bin/claude-local"
+BASELINE="$HOME/claude-local-baseline"
+DL_DIR="$HOME/Downloads/omlx"
+JQ=/usr/bin/jq
+
+verify=1
+memory_test=0
+force=0
+for arg in "$@"; do
+  case "$arg" in
+    --no-verify) verify=0 ;;
+    --memory-test) memory_test=1 ;;
+    --force) force=1 ;;
+    -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown option: $arg (see --help)" >&2; exit 2 ;;
+  esac
+done
+
+step() { printf '\n==> %s\n' "$*"; }
+info() { printf '    %s\n' "$*"; }
+warn() { printf '    WARNING: %s\n' "$*" >&2; }
+die() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
+
+# Run oMLX's bundled Python (has MLX; present once the app is installed).
+omlx_py() {
+  PYTHONHOME="$OMLX_PY_ROOT/cpython-3.11" \
+  PYTHONPATH="$OMLX_PY_ROOT/framework-mlx-base/lib/python3.11/site-packages" \
+    "$OMLX_PY_ROOT/cpython-3.11/bin/python3" "$@"
+}
+
+same_json() {  # same_json <a> <b>: true when both files hold the same JSON
+  cmp -s <("$JQ" -S . "$1" 2>/dev/null) <("$JQ" -S . "$2" 2>/dev/null)
+}
+
+api() {  # api <path> <json-or-@file>: POST to the local server
+  curl -sS -m 1200 "http://127.0.0.1:$PORT$1" -H "Authorization: Bearer local" \
+    -H "content-type: application/json" -H "anthropic-version: 2023-06-01" -d "$2"
+}
+
+# ---------------------------------------------------------------------------
+step "1/8 Checking this Mac"
+[ "$(uname -m)" = "arm64" ] || die "Apple Silicon is required."
+macos_ver=$(sw_vers -productVersion)
+macos_major=${macos_ver%%.*}
+[ "$macos_major" -ge 15 ] || die "macOS 15 or later is required (found $macos_ver)."
+ram_gib=$(( $(sysctl -n hw.memsize) / 1073741824 ))
+info "$(sysctl -n machdep.cpu.brand_string), $ram_gib GB memory, macOS $macos_ver"
+if [ "$ram_gib" -lt 36 ]; then
+  [ "$force" -eq 1 ] || die "This setup needs 36 GB of memory or more (found $ram_gib GB). Use --force to try anyway."
+  warn "only $ram_gib GB of memory; continuing because of --force"
+fi
+[ -x "$JQ" ] || die "/usr/bin/jq not found (it ships with macOS 15 and later)."
+
+CLAUDE_BIN="$HOME/.local/bin/claude"
+[ -x "$CLAUDE_BIN" ] || CLAUDE_BIN="$(command -v claude || true)"
+[ -n "$CLAUDE_BIN" ] || die "Claude Code not found. Install it first (https://code.claude.com/docs) and log in."
+info "Claude Code: $CLAUDE_BIN ($("$CLAUDE_BIN" --version 2>/dev/null | head -1))"
+
+have_model_gb=$(du -sg "$MODEL_DIR" 2>/dev/null | cut -f1 || true)
+need_gb=$(( 30 - ${have_model_gb:-0} ))
+free_gb=$(df -g "$HOME" | awk 'NR == 2 {print $4}')
+[ "$free_gb" -ge "$need_gb" ] || die "Need about $need_gb GB of free disk space; only $free_gb GB free."
+info "disk: $free_gb GB free"
+
+pid=$(lsof -nP -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | head -1 || true)
+if [ -n "$pid" ]; then
+  case "$(ps -o command= -p "$pid" 2>/dev/null)" in
+    *omlx*) info "port $PORT: oMLX already running (pid $pid)" ;;
+    *) die "Port $PORT is used by another program (pid $pid). Free it and re-run." ;;
+  esac
+else
+  info "port $PORT: free"
+fi
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) ;;
+  *) warn "~/.local/bin is not on your PATH; add it to run claude-local by name." ;;
+esac
+
+if [ -f "$BASELINE/sha.txt" ]; then
+  info "baseline of normal Claude Code already in $BASELINE"
+else
+  mkdir -p "$BASELINE"
+  shasum -a 256 "$HOME/.claude/settings.json" "$HOME/.claude/CLAUDE.md" 2>/dev/null > "$BASELINE/sha.txt" || true
+  "$CLAUDE_BIN" auth status > "$BASELINE/auth.txt" 2>&1 || true
+  info "recorded a baseline of normal Claude Code in $BASELINE"
+fi
+
+# ---------------------------------------------------------------------------
+step "2/8 Installing oMLX $OMLX_TAG into ~/Applications (INSTALL.md step 2)"
+have_ver=$("$OMLX_CLI" --version 2>/dev/null || true)
+if [ "$have_ver" = "${OMLX_TAG#v}" ]; then
+  info "oMLX $have_ver is already installed at $APP"
+else
+  if [ "$macos_major" -ge 26 ]; then flavor="macos26-27"; else flavor="macos15-sequoia"; fi
+  asset=$(curl -fsSL "https://api.github.com/repos/jundot/omlx/releases/tags/$OMLX_TAG" \
+    | "$JQ" -r --arg f "$flavor" '.assets[] | select(.name | endswith($f + ".dmg")) | "\(.browser_download_url) \(.digest)"') \
+    || die "Could not look up oMLX $OMLX_TAG on GitHub."
+  [ -n "$asset" ] || die "oMLX $OMLX_TAG has no $flavor DMG."
+  dmg_url=${asset%% *}
+  dmg_sha=${asset##*sha256:}
+  mkdir -p "$DL_DIR"
+  dmg="$DL_DIR/omlx-$OMLX_TAG-$flavor.dmg"
+  if ! echo "$dmg_sha  $dmg" | shasum -a 256 -c - >/dev/null 2>&1; then
+    info "downloading $dmg_url"
+    curl -fL --retry 3 -C - -o "$dmg" "$dmg_url" || curl -fL --retry 3 -o "$dmg" "$dmg_url"
+    echo "$dmg_sha  $dmg" | shasum -a 256 -c - >/dev/null 2>&1 \
+      || die "Checksum mismatch for $dmg. Delete it and re-run."
+  fi
+  info "download verified (SHA-256 $dmg_sha)"
+
+  mnt=$(mktemp -d)
+  hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$dmg" >/dev/null 2>&1 || die "Could not mount $dmg."
+  trap 'hdiutil detach "$mnt" >/dev/null 2>&1 || true' EXIT
+  codesign --verify --deep --strict "$mnt/oMLX.app" 2>/dev/null || die "oMLX.app failed its code-signature check."
+  spctl -a -t exec "$mnt/oMLX.app" 2>/dev/null || die "Gatekeeper did not accept oMLX.app (not notarized?)."
+  info "signed and notarized: $(codesign -dv --verbose=2 "$mnt/oMLX.app" 2>&1 | sed -n 's/^Authority=\(Developer ID Application.*\)/\1/p')"
+
+  # Stop claude-local's server before replacing the app it runs from.
+  if [ -x "$WRAPPER" ] && [ -d "$APP" ]; then "$WRAPPER" --local-stop >/dev/null 2>&1 || true; fi
+  mkdir -p "$HOME/Applications"
+  rm -rf "$APP.new"
+  ditto "$mnt/oMLX.app" "$APP.new"
+  rm -rf "$APP"
+  mv "$APP.new" "$APP"
+  hdiutil detach "$mnt" >/dev/null 2>&1 || true
+  trap - EXIT
+  info "installed oMLX $("$OMLX_CLI" --version) at $APP"
+  info "(don't open it from Finder; claude-local runs its server headless)"
+fi
+
+# ---------------------------------------------------------------------------
+step "3/8 Downloading the model $MODEL_REPO (INSTALL.md step 3)"
+mkdir -p "$MODEL_DIR"
+curl -fsSL "https://huggingface.co/api/models/$MODEL_REPO/tree/main?recursive=true" \
+  | "$JQ" -r '.[] | select(.type == "file" and .path != ".gitattributes") | "\(.path) \(.lfs.size // .size)"' \
+  > "$MODEL_DIR/.filelist" || die "Could not list the model files on Hugging Face."
+failed=0
+while read -r f sz; do
+  out="$MODEL_DIR/$f"
+  mkdir -p "$(dirname "$out")"
+  for try in 1 2 3 4 5; do
+    [ "$(stat -f %z "$out" 2>/dev/null || echo 0)" = "$sz" ] && break
+    info "downloading $f ($(( sz / 1000000 )) MB), attempt $try"
+    curl -fL --retry 5 --retry-delay 5 -C - -o "$out" "https://huggingface.co/$MODEL_REPO/resolve/main/$f" || true
+  done
+  if [ "$(stat -f %z "$out" 2>/dev/null || echo 0)" = "$sz" ]; then
+    info "OK   $f"
+  else
+    warn "FAIL $f"
+    failed=1
+  fi
+done < "$MODEL_DIR/.filelist"
+[ "$failed" -eq 0 ] || die "Some model files did not download. Re-run to resume."
+
+# ---------------------------------------------------------------------------
+step "4/8 Sizing for this Mac's GPU memory budget (INSTALL.md step 7)"
+budget=$(omlx_py -c "import mlx.core as mx; print(round(mx.device_info()['max_recommended_working_set_size'] / 2**30, 1))") \
+  || die "Could not read the GPU memory budget with oMLX's bundled Python."
+info "GPU budget: $budget GiB (the model's weights take 19.7 GB)"
+if awk -v b="$budget" 'BEGIN { exit !(b >= 34) }'; then
+  tier="balanced"
+elif awk -v b="$budget" 'BEGIN { exit !(b >= 27) }'; then
+  tier="aggressive"
+else
+  [ "$force" -eq 1 ] || die "A $budget GiB GPU budget is too small for this model at the context Claude Code needs. Use --force to try anyway."
+  tier="aggressive"
+  warn "budget below 27 GiB; long prompts will be rejected. Consider CLAUDE_LOCAL_CTX=65536 CLAUDE_LOCAL_MAX_OUT=16384."
+fi
+info "memory guard tier: $tier, Claude Code context window: 131072"
+
+# ---------------------------------------------------------------------------
+step "5/8 Configuring oMLX (INSTALL.md step 4)"
+mkdir -p "$OMLX_HOME"
+settings="$OMLX_HOME/settings.json"
+models="$OMLX_HOME/model_settings.json"
+# Keep one copy of any config that existed before claude-local configured it.
+if [ -f "$settings" ] && [ ! -e "$settings.pre-claude-local" ] \
+   && ! "$JQ" -e --argjson p "$PORT" '.server.port == $p and .scheduler.max_concurrent_requests == 1' "$settings" >/dev/null 2>&1; then
+  cp "$settings" "$settings.pre-claude-local"
+  info "saved your previous settings.json as settings.json.pre-claude-local"
+fi
+if [ -f "$models" ] && [ ! -e "$models.pre-claude-local" ] \
+   && ! "$JQ" -e --arg k "$MODEL_DIR_NAME" --arg a "$MODEL_ALIAS" '.models[$k].model_alias == $a' "$models" >/dev/null 2>&1; then
+  cp "$models" "$models.pre-claude-local"
+  info "saved your previous model_settings.json as model_settings.json.pre-claude-local"
+fi
+[ -f "$settings" ] || echo '{"version": "1.0"}' > "$settings"
+[ -f "$models" ] || echo '{"version": 1, "models": {}}' > "$models"
+
+tmp=$(mktemp)
+"$JQ" --argjson port "$PORT" --arg tier "$tier" '
+    .version //= "1.0"
+  | .server.host = "127.0.0.1" | .server.port = $port | .server.log_level //= "info"
+  | .scheduler.max_concurrent_requests = 1
+  | .cache.enabled = true | .cache.ssd_cache_max_size = "50GB" | .cache.hot_cache_max_size = "0"
+  | .memory.prefill_memory_guard = true | .memory.memory_guard_tier = $tier
+  | .sampling.max_context_window = 163840 | .sampling.max_tokens = 32768
+  ' "$settings" > "$tmp"
+config_changed=0
+if same_json "$tmp" "$settings"; then
+  info "settings.json is up to date"
+  rm -f "$tmp"
+else
+  config_changed=1
+  mv "$tmp" "$settings"
+  info "updated $settings"
+fi
+
+model_entry=$(cat <<'MODEL_ENTRY'
+@@MODEL_ENTRY@@
+MODEL_ENTRY
+)
+tmp=$(mktemp)
+"$JQ" --arg k "$MODEL_DIR_NAME" --argjson e "$model_entry" \
+  '.version //= 1 | .models[$k] = ((.models[$k] // {}) + $e)' "$models" > "$tmp"
+if same_json "$tmp" "$models"; then
+  info "model_settings.json is up to date"
+  rm -f "$tmp"
+else
+  config_changed=1
+  mv "$tmp" "$models"
+  info "updated $models"
+fi
+
+# ---------------------------------------------------------------------------
+step "6/8 Creating the isolated Claude Code profile ~/.claude-local (INSTALL.md step 5)"
+mkdir -p "$PROFILE"
+if [ -e "$HOME/.claude/CLAUDE.md" ] && [ ! -e "$PROFILE/CLAUDE.md" ]; then
+  ln -s "$HOME/.claude/CLAUDE.md" "$PROFILE/CLAUDE.md"
+  info "linked ~/.claude-local/CLAUDE.md -> ~/.claude/CLAUDE.md"
+fi
+if [ -e "$PROFILE/settings.json" ]; then
+  info "~/.claude-local/settings.json already exists; leaving it alone"
+else
+  { [ -f "$HOME/.claude/settings.json" ] && cat "$HOME/.claude/settings.json" || echo '{}'; } \
+    | "$JQ" '{cleanupPeriodDays, theme, hooks} | with_entries(select(.value != null))
+        + {effortLevel: "medium", useAutoModeDuringPlan: false, disableClaudeAiConnectors: true,
+           permissions: {defaultMode: "default"}}' > "$PROFILE/settings.json"
+  info "wrote ~/.claude-local/settings.json (theme and hooks copied from ~/.claude/settings.json)"
+fi
+
+# ---------------------------------------------------------------------------
+step "7/8 Installing the claude-local wrapper (INSTALL.md step 6)"
+mkdir -p "$(dirname "$WRAPPER")"
+new=$(mktemp)
+cat > "$new" <<'CLAUDE_LOCAL_SCRIPT'
+@@WRAPPER@@
+CLAUDE_LOCAL_SCRIPT
+bash -n "$new" || die "internal error: the embedded wrapper has a syntax error"
+if [ -f "$WRAPPER" ] && cmp -s "$new" "$WRAPPER"; then
+  info "$WRAPPER is up to date"
+  rm -f "$new"
+else
+  if [ -f "$WRAPPER" ]; then
+    backup="$WRAPPER.bak-$(date +%Y%m%d-%H%M%S)"
+    cp -p "$WRAPPER" "$backup"
+    info "backed up the previous wrapper to $backup"
+  fi
+  mv "$new" "$WRAPPER"
+  info "installed $WRAPPER"
+fi
+chmod 755 "$WRAPPER"
+
+# ---------------------------------------------------------------------------
+if [ "$verify" -eq 0 ]; then
+  step "8/8 Skipping checks (--no-verify)"
+  info "Start with: claude-local --local-start, then claude-local"
+  exit 0
+fi
+
+step "8/8 Checking the install (INSTALL.md step 8)"
+problems=0
+pass() { info "PASS $*"; }
+fail() { warn "FAIL $*"; problems=$((problems + 1)); }
+
+if command -v orbctl >/dev/null 2>&1 && [ "$(orbctl status 2>/dev/null)" = "Running" ]; then
+  warn "OrbStack is running and can hold ~13 GB; 'orbctl stop' before long sessions"
+fi
+if [ "$config_changed" -eq 1 ] && [ -n "${pid:-}" ]; then
+  warn "oMLX was already running with older settings. Run 'claude-local --local-stop' when no session is using it, then re-run this script."
+fi
+
+info "starting the server and loading the model (about 10-15 s the first time)"
+if "$WRAPPER" --local-start >/dev/null; then pass "server up at http://127.0.0.1:$PORT with $MODEL_ALIAS"; else fail "server did not start; see ~/.omlx/logs/claude-local-server.log"; fi
+
+answer=$(api /v1/messages '{"model":"'"$MODEL_ALIAS"'","max_tokens":2000,"thinking":{"type":"adaptive"},"messages":[{"role":"user","content":"What is 17*23? Answer with just the number."}]}' \
+  | "$JQ" -r '[.content[]? | select(.type == "text") | .text] | join("")' 2>/dev/null || true)
+case "$answer" in *391*) pass "API answers correctly (17*23 = 391)" ;; *) fail "API check: expected 391, got '$answer'" ;; esac
+
+call=$(api /v1/messages '{"model":"'"$MODEL_ALIAS"'","max_tokens":4000,"thinking":{"type":"adaptive"},"tools":[{"name":"Bash","description":"Run a shell command.","input_schema":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}],"messages":[{"role":"user","content":"List the files in /tmp using the Bash tool."}]}' \
+  | "$JQ" -r '"\(.stop_reason) \([.content[]? | select(.type == "tool_use") | .name] | join(","))"' 2>/dev/null || true)
+case "$call" in "tool_use Bash"*) pass "tool calling works" ;; *) fail "tool-call check: got '$call'" ;; esac
+
+testdir=$(mktemp -d)
+reply=$(cd "$testdir" && "$WRAPPER" -p "Reply with exactly the word OK and nothing else." 2>&1 || true)
+case "$reply" in *OK*) pass "claude-local -p works" ;; *) fail "claude-local -p: $(printf '%s' "$reply" | tail -3)" ;; esac
+rm -rf "$testdir"
+
+if [ "$memory_test" -eq 1 ]; then
+  info "memory test: one prompt at Claude Code's largest size for a 131072 window (~108K tokens)"
+  long=$(mktemp)
+  expected=$(omlx_py - 131072 "$long" <<'PY'
+import glob, json, os, sys, sysconfig
+target = int((int(sys.argv[1]) - 23000) * 3.8)
+text = ""
+for f in sorted(glob.glob(os.path.join(sysconfig.get_paths()["stdlib"], "*.py"))):
+    text += f"\n##### FILE: {os.path.basename(f)}\n" + open(f, encoding="utf-8", errors="replace").read()
+    if len(text) >= target:
+        break
+text = text[:target]
+last = text[text.rindex("##### FILE: ") + 12:].split("\n", 1)[0]
+q = "\n\nQuestion: What is the file name in the very last '##### FILE:' header above? Reply with only the file name."
+json.dump({"model": "qwen3.6-35b-a3b", "max_tokens": 200, "thinking": {"type": "disabled"},
+           "messages": [{"role": "user", "content": text + q}]}, open(sys.argv[2], "w"))
+print(last)
+PY
+)
+  start=$(date +%s)
+  result=$(api /v1/messages "@$long" | "$JQ" -r '.content[0].text // .error.message // "no response"' 2>/dev/null || true)
+  secs=$(( $(date +%s) - start ))
+  peak=$(footprint -p "$(cat "$OMLX_HOME/claude-local-server.pid" 2>/dev/null)" 2>/dev/null | awk '/phys_footprint_peak:/ {print $2, $3}')
+  if [ "$result" = "$expected" ]; then pass "memory test answered correctly in $secs s (server peak ${peak:-unknown})"; else fail "memory test: expected '$expected', got '$result' (see INSTALL.md step 7)"; fi
+  rm -f "$long"
+fi
+
+if shasum -a 256 "$HOME/.claude/settings.json" "$HOME/.claude/CLAUDE.md" 2>/dev/null | diff -q - "$BASELINE/sha.txt" >/dev/null; then
+  pass "normal Claude Code settings unchanged"
+else
+  fail "normal Claude Code settings differ from the baseline in $BASELINE"
+fi
+if "$CLAUDE_BIN" auth status 2>&1 | diff -q - "$BASELINE/auth.txt" >/dev/null; then
+  pass "normal Claude Code login unchanged"
+else
+  fail "normal Claude Code login differs from the baseline in $BASELINE"
+fi
+
+echo
+if [ "$problems" -eq 0 ]; then
+  echo "claude-local is installed and working."
+else
+  echo "claude-local is installed, but $problems check(s) failed. See INSTALL.md, Troubleshooting."
+fi
+cat <<'NEXT'
+
+Next:
+  claude-local                  interactive session (the first run asks for a theme and folder trust)
+  claude-local --local-status   server, model and memory warnings
+  claude-local --local-stop     stop the server and free ~20 GB
+In a session, /context should show about 16K of 131.1K tokens used.
+NEXT
+[ "$problems" -eq 0 ]

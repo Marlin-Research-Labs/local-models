@@ -1,0 +1,240 @@
+#!/bin/bash
+# claude-local: run Claude Code against a local open-weight model.
+#
+# Default backend: oMLX (~/Applications/oMLX.app) serving Qwen3.6-35B-A3B
+# (Unsloth UD-MLX-4bit) on http://127.0.0.1:8765. Fallback backend: Ollama.
+#
+# Everything here is scoped to this process. It never edits ~/.claude,
+# ~/.claude.json, shell rc files or launchd, so the normal `claude` command
+# keeps its own login, settings and history. Claude Code state for local
+# sessions lives in ~/.claude-local (CLAUDE_CONFIG_DIR).
+#
+# Org-managed settings (MintMCP hooks, OTEL telemetry) still apply here by
+# design; nothing in this script bypasses them.
+#
+# Wrapper-only commands (first argument):
+#   --local-status   show server, model and memory warnings
+#   --local-start    start the server and load the model, then exit
+#   --local-stop     stop the oMLX server started by claude-local
+#   --local-help     show this help
+#
+# Overrides (environment, per invocation):
+#   CLAUDE_LOCAL_BACKEND  omlx (default) | ollama
+#   CLAUDE_LOCAL_MODEL    model id served by the backend
+#   CLAUDE_LOCAL_PORT     backend port (oMLX 8765, Ollama 11434)
+#   CLAUDE_LOCAL_CTX      context window Claude Code plans for (default 131072)
+#   CLAUDE_LOCAL_MAX_OUT  max output tokens per response (default 32000)
+
+set -euo pipefail
+
+warn() { echo "claude-local: warning: $*" >&2; }
+die() { echo "claude-local: $*" >&2; exit 1; }
+
+# Native installer symlink (follows updates); fall back to whatever claude is on PATH.
+CLAUDE_BIN="$HOME/.local/bin/claude"
+[ -x "$CLAUDE_BIN" ] || CLAUDE_BIN="$(command -v claude || true)"
+[ -n "$CLAUDE_BIN" ] || die "Claude Code not found (expected ~/.local/bin/claude)"
+
+# oMLX.app in ~/Applications (no admin needed), else /Applications.
+OMLX_APP="$HOME/Applications/oMLX.app"
+[ -d "$OMLX_APP" ] || [ ! -d /Applications/oMLX.app ] || OMLX_APP="/Applications/oMLX.app"
+OMLX_CLI="$OMLX_APP/Contents/MacOS/omlx-cli"
+OMLX_HOME="$HOME/.omlx"
+OMLX_LOG="$OMLX_HOME/logs/claude-local-server.log"
+OMLX_PIDFILE="$OMLX_HOME/claude-local-server.pid"
+LOCAL_CONFIG_DIR="$HOME/.claude-local"
+
+backend="${CLAUDE_LOCAL_BACKEND:-omlx}"
+case "$backend" in
+  omlx)
+    port="${CLAUDE_LOCAL_PORT:-8765}"
+    model="${CLAUDE_LOCAL_MODEL:-qwen3.6-35b-a3b}"
+    token="local"
+    ;;
+  ollama)
+    port="${CLAUDE_LOCAL_PORT:-11434}"
+    model="${CLAUDE_LOCAL_MODEL:-qwen3.6:35b-a3b-coding-nvfp4}"
+    token="ollama"
+    ;;
+  *)
+    echo "claude-local: unknown CLAUDE_LOCAL_BACKEND '$backend' (use omlx or ollama)" >&2
+    exit 2
+    ;;
+esac
+base_url="http://127.0.0.1:$port"
+ctx="${CLAUDE_LOCAL_CTX:-131072}"
+max_out="${CLAUDE_LOCAL_MAX_OUT:-32000}"
+
+# True when the backend answers and lists $model.
+server_has_model() {
+  curl -fsS -m 3 -H "Authorization: Bearer $token" "$base_url/v1/models" 2>/dev/null \
+    | /usr/bin/jq -e --arg m "$model" 'any(.data[]?; .id == $m)' >/dev/null 2>&1
+}
+
+port_listener_pid() {
+  lsof -nP -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null | head -1 || true
+}
+
+# Two ~20 GB models cannot share 36 GB, and OrbStack's VM holds ~13 GB.
+memory_warnings() {
+  if command -v orbctl >/dev/null 2>&1 && [ "$(orbctl status 2>/dev/null)" = "Running" ]; then
+    warn "OrbStack is running (its VM can hold ~13 GB). Stop it with 'orbctl stop' for best performance."
+  fi
+  if [ "$backend" != "ollama" ]; then
+    local n
+    n=$(curl -fsS -m 2 http://127.0.0.1:11434/api/ps 2>/dev/null | /usr/bin/jq '.models | length' 2>/dev/null || echo 0)
+    [ "${n:-0}" -gt 0 ] && warn "Ollama has $n model(s) loaded; unload them with 'ollama stop <model>'."
+  fi
+  if command -v lms >/dev/null 2>&1; then
+    local m
+    m=$(lms ps --json 2>/dev/null | /usr/bin/jq 'length' 2>/dev/null || echo 0)
+    [ "${m:-0}" -gt 0 ] && warn "LM Studio has $m model(s) loaded; unload them with 'lms unload --all'."
+  fi
+  return 0
+}
+
+start_omlx() {
+  [ -x "$OMLX_CLI" ] || die "oMLX not found at $OMLX_CLI"
+  local pid
+  pid=$(port_listener_pid)
+  if [ -n "$pid" ]; then
+    die "port $port is in use by pid $pid, but it does not serve '$model'. Check it with: lsof -nP -iTCP:$port"
+  fi
+  mkdir -p "$(dirname "$OMLX_LOG")"
+  echo "claude-local: starting oMLX on $base_url (log: $OMLX_LOG)" >&2
+  # Own process group (set -m) so Ctrl-C in Claude Code never reaches the server.
+  ( set -m; nohup "$OMLX_CLI" serve --port "$port" </dev/null >>"$OMLX_LOG" 2>&1 &
+    echo $! >"$OMLX_PIDFILE" )
+  local i=0
+  until server_has_model; do
+    i=$((i + 1))
+    if [ "$i" -ge 90 ]; then
+      die "oMLX did not list '$model' within 90 s; see $OMLX_LOG"
+    fi
+    if ! kill -0 "$(cat "$OMLX_PIDFILE" 2>/dev/null)" 2>/dev/null; then
+      die "oMLX exited during startup; see $OMLX_LOG"
+    fi
+    sleep 1
+  done
+}
+
+stop_omlx() {
+  local pid
+  pid=$(cat "$OMLX_PIDFILE" 2>/dev/null || true)
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || pid=$(port_listener_pid)
+  if [ -z "$pid" ]; then
+    echo "claude-local: oMLX is not running on port $port"
+    rm -f "$OMLX_PIDFILE"
+    return 0
+  fi
+  case "$(ps -o command= -p "$pid" 2>/dev/null)" in
+    *omlx*) ;;
+    *) die "pid $pid on port $port is not oMLX; not stopping it" ;;
+  esac
+  kill -TERM "$pid" 2>/dev/null || true
+  local i=0
+  while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 20 ]; do sleep 1; i=$((i + 1)); done
+  # The server can linger holding GPU memory (oMLX #3431); force it if needed.
+  kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+  rm -f "$OMLX_PIDFILE"
+  echo "claude-local: oMLX stopped"
+}
+
+# Ask the server to load the model now, so the first Claude Code turn
+# doesn't also pay the ~20 GB load time.
+warm_model() {
+  curl -fsS -m 600 -H "Authorization: Bearer $token" -H "content-type: application/json" \
+    -H "anthropic-version: 2023-06-01" "$base_url/v1/messages" \
+    -d "{\"model\":\"$model\",\"max_tokens\":1,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"thinking\":{\"type\":\"disabled\"}}" \
+    >/dev/null
+}
+
+case "${1:-}" in
+  --local-help)
+    sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+    ;;
+  --local-status)
+    echo "backend: $backend  url: $base_url  model: $model  context: $ctx  max output: $max_out"
+    echo "claude: $CLAUDE_BIN  omlx: $OMLX_CLI"
+    if server_has_model; then echo "server: up, '$model' available"; else echo "server: down or '$model' not listed"; fi
+    memory_warnings
+    exit 0
+    ;;
+  --local-stop)
+    [ "$backend" = "omlx" ] || die "--local-stop only manages oMLX; quit Ollama from its menu-bar app"
+    stop_omlx
+    exit 0
+    ;;
+  --local-start)
+    memory_warnings
+    if ! server_has_model; then
+      [ "$backend" = "omlx" ] || die "Ollama is not serving '$model' at $base_url"
+      start_omlx
+    fi
+    echo "claude-local: loading '$model'..." >&2
+    warm_model || die "the model failed to load; see $OMLX_LOG"
+    echo "claude-local: ready at $base_url"
+    exit 0
+    ;;
+esac
+
+memory_warnings
+if ! server_has_model; then
+  if [ "$backend" = "omlx" ]; then
+    start_omlx
+  else
+    die "Ollama is not serving '$model' at $base_url (is the Ollama app running?)"
+  fi
+fi
+
+[ -d "$LOCAL_CONFIG_DIR" ] || mkdir -p "$LOCAL_CONFIG_DIR"
+
+# Drop anything that could route or authenticate elsewhere.
+unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_PROFILE ANTHROPIC_BETAS \
+  ANTHROPIC_SMALL_FAST_MODEL CLAUDE_CODE_SIMPLE CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX \
+  CLAUDE_CODE_USE_FOUNDRY CLAUDE_CODE_USE_MANTLE CLAUDE_CODE_USE_GATEWAY \
+  CLAUDE_CODE_USE_ANTHROPIC_AWS CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD \
+  CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT \
+  CLAUDE_CODE_AUTO_COMPACT_WINDOW CLAUDE_SECURESTORAGE_CONFIG_DIR
+
+# Isolated profile and local endpoint.
+export CLAUDE_CONFIG_DIR="$LOCAL_CONFIG_DIR"
+export ANTHROPIC_BASE_URL="$base_url"
+export ANTHROPIC_AUTH_TOKEN="$token"
+
+# Every model tier maps to the one loaded model.
+export ANTHROPIC_MODEL="$model" CLAUDE_CODE_SUBAGENT_MODEL="$model"
+export ANTHROPIC_DEFAULT_FABLE_MODEL="$model" ANTHROPIC_DEFAULT_OPUS_MODEL="$model"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="$model" ANTHROPIC_DEFAULT_HAIKU_MODEL="$model"
+
+# Context: Claude Code assumes 200K for unknown models; declare the real window.
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$ctx" CLAUDE_CODE_MAX_OUTPUT_TOKENS="$max_out"
+
+# Keep the prompt prefix stable so the server's prefix cache hits.
+export CLAUDE_CODE_ATTRIBUTION_HEADER=0 CLAUDE_CODE_TOTAL_TOKENS_REMINDER=off
+
+# Compatibility with a non-Anthropic backend.
+export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1 ENABLE_CLAUDEAI_MCP_SERVERS=false
+export CLAUDE_CODE_DISABLE_FAST_MODE=1 CLAUDE_CODE_AUTO_MODE_SERVER=0
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+
+# One server slot: no background side requests or parallel subagents.
+export CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=1 CLAUDE_CODE_ENABLE_AWAY_SUMMARY=0
+export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false
+export CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1
+
+# Local prefill of long prompts can take minutes.
+export API_TIMEOUT_MS=3000000 CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS=1800000
+export CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS=600000
+
+# Claude Code subcommands (mcp, doctor, update, ...) take no session flags.
+case "${1:-}" in
+  agents|attach|auth|auto-mode|doctor|gateway|import|install|logs|mcp|plugin|plugins|project|respawn|rm|setup-token|stop|kill|ultrareview|update|upgrade)
+    exec "$CLAUDE_BIN" "$@"
+    ;;
+esac
+
+# WebSearch is an Anthropic server-side tool; LSP schema changes break the prefix cache.
+exec "$CLAUDE_BIN" --strict-mcp-config --exclude-dynamic-system-prompt-sections \
+  --disallowedTools=WebSearch,LSP "$@"
