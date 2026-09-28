@@ -1257,7 +1257,7 @@ The quality model's weights are smaller, but its attention cache is 3.2× larger
 | quality (Qwen3.8, 6-bit) | on | 23.7 GB | 131072 | 104.6K + image | 335 s | 44 GB | not tested |
 | laguna (S 2.1) | off | 63.3 GB | 131072 | 103.8K | 204 s | 70 GB | 163840 |
 
-- **Laguna S:** a 147456 window also passed, a 119.2K prompt in 249 s peaking at 72 GB. That is close to the guard's 73.9 GiB limit, so the built-in window stays at 131072 to leave room for other apps. To use the larger one when the Studio is otherwise idle, put `laguna-s-2.1=147456` in `~/.config/claude-local/windows`.
+- **Laguna S:** a 147456 window fits in memory: a 119.2K prompt took 249 s and peaked at 72 GB, close to the guard's 73.9 GiB limit. But in one of two runs the model answered the test question wrong, naming an earlier file in the prompt, while it answered correctly at 131072. The built-in window stays at 131072, which also leaves more room for other apps.
 - **Quality model:** memory would allow a larger window, but a cold 104K prompt already takes almost 6 minutes.
 
 **16 GB and 128 GB: estimates, not yet measured.**
