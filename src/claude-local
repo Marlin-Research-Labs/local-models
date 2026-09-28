@@ -1,11 +1,14 @@
 #!/bin/bash
 # claude-local: run Claude Code against a local open-weight model.
 #
-# Models, served by oMLX (~/Applications/oMLX.app) on http://127.0.0.1:8765:
-#   fast     Qwen3.6-35B-A3B (Unsloth UD-MLX-4bit), the default
-#   quality  Qwen3.8-27B (oMLX oQ4e-mtp), slower but stronger; install it with
-#            install-claude-local.sh --with-quality
-# Either model can run with image input (vision) on or off (the default).
+# Models are served by oMLX (~/Applications/oMLX.app) on http://127.0.0.1:8765
+# and picked for the Mac's memory (see claude-local --local-status):
+#   fast     Qwen: Qwen3.6-35B-A3B (36 GB and up) or Qwen3.5-9B (16 GB Macs)
+#   quality  Qwen3.8-27B, slower but stronger (36 GB and up)
+#   laguna   Poolside Laguna: XS 2.1 (36 GB Macs) or S 2.1 (96 GB and up)
+# Install extra models with install-claude-local.sh --with-quality, --with-laguna
+# or --with-all. Qwen models can run with image input (vision) on or off (the
+# default); Laguna is text only.
 #
 # Everything here is scoped to this process. It never edits ~/.claude,
 # ~/.claude.json, shell rc files or launchd, so the normal `claude` command
@@ -16,21 +19,26 @@
 # design; nothing in this script bypasses them.
 #
 # Wrapper options (they must come before any Claude Code arguments):
-#   --local-fast | --local-quality       choose the model (default: fast)
+#   --local-fast | --local-quality | --local-laguna   choose the model
 #   --local-vision | --local-no-vision   image input on or off (default: off)
 #   --local-set-default   save the model and vision options given, then exit
-#   --local-status        show the selection, the server and installed models
+#   --local-status        show this Mac's models, the selection and the server
 #   --local-start         start the server and load the selected model, then exit
 #   --local-stop          stop the oMLX server started by claude-local
 #   --local-help          show this help
+# The default model is fast, or laguna on Macs with 96 GB or more.
 #
-# Environment, per invocation: CLAUDE_LOCAL_PROFILE=fast|quality and
+# Environment, per invocation: CLAUDE_LOCAL_PROFILE=fast|quality|laguna and
 # CLAUDE_LOCAL_VISION=on|off. For experiments: CLAUDE_LOCAL_MODEL (served model
-# id), CLAUDE_LOCAL_CTX, CLAUDE_LOCAL_MAX_OUT, CLAUDE_LOCAL_PORT and
+# id), CLAUDE_LOCAL_CTX, CLAUDE_LOCAL_MAX_OUT, CLAUDE_LOCAL_PORT,
+# CLAUDE_LOCAL_LEAN=on|off (a smaller tool set; on by default on 16 GB Macs),
+# CLAUDE_LOCAL_MACHINE=16|36|96|128 (the memory class) and
 # CLAUDE_LOCAL_BACKEND=omlx|ollama.
 #
 # Precedence: option > environment > saved default > built-in. Saved defaults
-# live in ~/.config/claude-local/defaults (or $XDG_CONFIG_HOME/claude-local).
+# live in ~/.config/claude-local/defaults (or $XDG_CONFIG_HOME/claude-local);
+# context windows measured on this Mac (install-claude-local.sh --memory-test)
+# in the windows file next to it.
 
 set -euo pipefail
 
@@ -50,6 +58,7 @@ OMLX_HOME="$HOME/.omlx"
 OMLX_LOG="$OMLX_HOME/logs/claude-local-server.log"
 LOCAL_CONFIG_DIR="$HOME/.claude-local"
 DEFAULTS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-local/defaults"
+WINDOWS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-local/windows"
 
 # --- Wrapper options: a leading run of --local-* arguments ------------------
 opt_profile=""
@@ -59,9 +68,10 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --local-fast) opt_profile=fast ;;
     --local-quality) opt_profile=quality ;;
+    --local-laguna) opt_profile=laguna ;;
     --local-vision) opt_vision=on ;;
     --local-no-vision) opt_vision=off ;;
-    --local-status|--local-start|--local-stop|--local-help|--local-set-default)
+    --local-status|--local-start|--local-stop|--local-help|--local-set-default|--local-catalog)
       [ -z "$cmd" ] || die "one of --local-status/start/stop/help/set-default at a time"
       cmd="${1#--local-}" ;;
     --local-*) echo "claude-local: unknown option '$1' (see claude-local --local-help)" >&2; exit 2 ;;
@@ -75,6 +85,146 @@ if [ "$cmd" = "help" ]; then
   exit 0
 fi
 
+# --- This Mac's memory class ------------------------------------------------
+# The models and context windows depend on how much memory the GPU may use,
+# which macOS derives from the RAM size.
+ram_gb=$(( $(sysctl -n hw.memsize) / 1073741824 ))
+case "${CLAUDE_LOCAL_MACHINE:-}" in
+  "")
+    if [ "$ram_gb" -ge 128 ]; then class=128
+    elif [ "$ram_gb" -ge 96 ]; then class=96
+    elif [ "$ram_gb" -ge 36 ]; then class=36
+    else class=16; fi
+    class_src="$ram_gb GB" ;;
+  16|36|96|128) class=$CLAUDE_LOCAL_MACHINE; class_src="CLAUDE_LOCAL_MACHINE; this Mac has $ram_gb GB" ;;
+  *) die "CLAUDE_LOCAL_MACHINE must be 16, 36, 96 or 128" ;;
+esac
+case "$class" in
+  96|128) class_default=laguna ;;
+  *) class_default=fast ;;
+esac
+
+# The model for each role on each class of Mac. catalog <profile> sets:
+#   repo, rev   Hugging Face repository and pinned revision
+#   base        model folder under ~/.omlx/models; its vision variant (if any)
+#               is the symlink <base>-vision, served by oMLX's vision engine
+#   base_alias  served model id (never starting with claude-); vision: <alias>-vision
+#   gb          download size, GB
+#   text_ctx    context window Claude Code plans for, text only
+#   vision_ctx  the same with vision on; empty when the model has no image input
+#   row_out     max output tokens
+#   caps        extra Claude Code capability flags
+#   measured    yes when the windows were measured on such a Mac with
+#               install-claude-local.sh --memory-test, no for estimates
+# A role that doesn't fit this class sets base="" and why.
+catalog() {
+  repo="" rev="" base="" base_alias="" gb=0 text_ctx=0 vision_ctx="" row_out=32000 caps="" measured=no why=""
+  case "$class:$1" in
+    16:fast)
+      repo=craquehouse/Qwen3.5-9B-oQ4e-fp16-text-only; rev=61b16465e2c70e58995a79a25fc40216a37984c0
+      base=Qwen3.5-9B-oQ4e-fp16-text-only; base_alias=qwen3.5-9b; gb=6
+      text_ctx=65536; row_out=8192; caps="-mid_conv_system" ;;
+    16:quality) why="no quality model fits in a 16 GB Mac; the fast model (Qwen3.5-9B) is the one to use" ;;
+    16:laguna)  why="Laguna needs a Mac with 36 GB or more; its smallest build doesn't fit in this Mac's GPU memory" ;;
+    36:fast)
+      repo=unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit; rev=6700c3e5bdeb050a379c8d2a4133f43f3647f20f
+      base=Qwen3.6-35B-A3B-UD-MLX-4bit; base_alias=qwen3.6-35b-a3b; gb=22
+      text_ctx=131072; vision_ctx=106496; measured=yes ;;
+    36:quality)
+      repo=Jundot/Qwen3.8-27B-oQ4e-mtp; rev=04dc5509edd8670fc78cc8c2f74bf9b77b1f2acc
+      base=Qwen3.8-27B-oQ4e-mtp; base_alias=qwen3.8-27b; gb=17
+      text_ctx=94208; vision_ctx=81920; row_out=20000; caps="-mid_conv_system"; measured=yes ;;
+    36:laguna)
+      repo=mlx-coders/Laguna-XS-2.1-oQ4e; rev=2cdec8e0a0e3ce1562c92767c394bb952835ee11
+      base=Laguna-XS-2.1-oQ4e; base_alias=laguna-xs-2.1; gb=20
+      text_ctx=114688; caps="-mid_conv_system"; measured=yes ;;
+    96:fast|128:fast)
+      repo=Jundot/Qwen3.6-35B-A3B-oQ6-mtp; rev=276df7cc7b6face3d66d635bb841248c51ec3e8d
+      base=Qwen3.6-35B-A3B-oQ6-mtp; base_alias=qwen3.6-35b-a3b-oq6; gb=31
+      text_ctx=262144; vision_ctx=262144; caps="-mid_conv_system"
+      if [ "$class" = 96 ]; then measured=yes; fi ;;
+    96:quality|128:quality)
+      repo=Jundot/Qwen3.8-27B-oQ6e-mtp; rev=f7ec1f012451c7a76e775e2fdefdd5f0a51f11f7
+      base=Qwen3.8-27B-oQ6e-mtp; base_alias=qwen3.8-27b-oq6; gb=24
+      text_ctx=131072; vision_ctx=131072; row_out=20000; caps="-mid_conv_system"
+      if [ "$class" = 96 ]; then measured=yes; fi ;;
+    96:laguna|128:laguna)
+      repo=mlx-community/Laguna-S-2.1-oQ4e-fast; rev=871f699b0e8852ee2ab74fb1e67767bdcc6358ee
+      base=Laguna-S-2.1-oQ4e-fast; base_alias=laguna-s-2.1; gb=64
+      text_ctx=131072; caps="-mid_conv_system"
+      if [ "$class" = 96 ]; then measured=yes; else text_ctx=196608; fi ;;
+  esac
+}
+
+# A window measured on this Mac by install-claude-local.sh --memory-test.
+saved_window() {  # saved_window <alias>
+  [ -r "$WINDOWS_FILE" ] || return 0
+  awk -F= -v a="$1" '{ sub(/#.*/, ""); gsub(/[[:space:]]/, "") }
+    $1 == a && $2 ~ /^[0-9]+$/ { w = $2 } END { if (w) print w }' "$WINDOWS_FILE"
+}
+
+# profile_row <profile> <vision>: the catalog entry plus, for that vision
+# setting, dir, alias and row_ctx (and ctx_src, where the window comes from).
+# dir is empty when the combination isn't available; why says why.
+profile_row() {
+  catalog "$1"
+  dir="" alias="" row_ctx=0 ctx_src=""
+  [ -n "$base" ] || return 0
+  if [ "$2" = "on" ]; then
+    if [ -z "$vision_ctx" ]; then
+      why="$(label "$1") has no image input"
+      return 0
+    fi
+    dir="$base-vision"; alias="$base_alias-vision"; row_ctx=$vision_ctx
+  else
+    dir=$base; alias=$base_alias; row_ctx=$text_ctx
+  fi
+  local w
+  w=$(saved_window "$alias")
+  if [ -n "$w" ]; then
+    row_ctx=$w; ctx_src="set for this Mac in $WINDOWS_FILE"
+  elif [ "$measured" = "yes" ]; then
+    ctx_src="measured on a $class GB Mac"
+  else
+    ctx_src="estimate; measure it with install-claude-local.sh --memory-test"
+  fi
+}
+
+label() {
+  case "$1" in
+    fast) echo "the fast model ($base_alias)" ;;
+    quality) echo "the quality model ($base_alias)" ;;
+    laguna) echo "Laguna ($base_alias)" ;;
+  esac
+}
+installed() { [ -f "$OMLX_HOME/models/$1/config.json" ]; }
+
+# Why the model for the current row isn't usable, as a hint for the user.
+missing_hint() {
+  case "$dir" in
+    *-vision) if installed "$base"; then
+                echo "its vision variant (~/.omlx/models/$dir) is missing; re-run install-claude-local.sh to create it"
+                return
+              fi ;;
+  esac
+  case "$profile" in
+    fast) echo "the fast model ($base) is not installed; run install-claude-local.sh" ;;
+    *) echo "the $profile model ($base) is not installed; run install-claude-local.sh --with-$profile" ;;
+  esac
+}
+
+if [ "$cmd" = "catalog" ]; then
+  # For install-claude-local.sh: this Mac's roles, one tab-separated line each:
+  # profile repo rev base alias gb text_ctx vision_ctx out default why
+  for p in fast quality laguna; do
+    catalog "$p"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$p" "${repo:--}" "${rev:--}" "${base:--}" \
+      "${base_alias:--}" "$gb" "$text_ctx" "${vision_ctx:--}" "$row_out" \
+      "$([ "$p" = "$class_default" ] && echo yes || echo no)" "${why:--}"
+  done
+  exit 0
+fi
+
 # --- Resolve model and vision ------------------------------------------------
 saved_profile=""
 saved_vision=""
@@ -84,72 +234,48 @@ if [ -r "$DEFAULTS_FILE" ]; then
     line=${line//[[:space:]]/}    # drop all whitespace, including CR
     case "$line" in
       "") ;;
-      profile=fast|profile=quality) saved_profile=${line#*=} ;;
+      profile=fast|profile=quality|profile=laguna) saved_profile=${line#*=} ;;
       vision=on|vision=off) saved_vision=${line#*=} ;;
-      *) warn "ignoring '$line' in $DEFAULTS_FILE (expected profile=fast|quality or vision=on|off)" ;;
+      *) warn "ignoring '$line' in $DEFAULTS_FILE (expected profile=fast|quality|laguna or vision=on|off)" ;;
     esac
   done < "$DEFAULTS_FILE"
 fi
 
 env_profile="${CLAUDE_LOCAL_PROFILE:-}"
-case "$env_profile" in ""|fast|quality) ;; *) die "CLAUDE_LOCAL_PROFILE must be fast or quality" ;; esac
+case "$env_profile" in ""|fast|quality|laguna) ;; *) die "CLAUDE_LOCAL_PROFILE must be fast, quality or laguna" ;; esac
 case "${CLAUDE_LOCAL_VISION:-}" in
   "") env_vision="" ;;
   on|1|yes|true) env_vision=on ;;
   off|0|no|false) env_vision=off ;;
   *) die "CLAUDE_LOCAL_VISION must be on or off" ;;
 esac
+case "${CLAUDE_LOCAL_LEAN:-}" in
+  "") if [ "$class" = 16 ]; then lean=on; lean_src="built-in for 16 GB Macs"; else lean=off; lean_src="built-in"; fi ;;
+  on|1|yes|true) lean=on; lean_src="CLAUDE_LOCAL_LEAN" ;;
+  off|0|no|false) lean=off; lean_src="CLAUDE_LOCAL_LEAN" ;;
+  *) die "CLAUDE_LOCAL_LEAN must be on or off" ;;
+esac
 
 # Remember where each choice came from, for --local-status.
 if [ -n "$opt_profile" ]; then profile=$opt_profile; profile_src="option"
 elif [ -n "$env_profile" ]; then profile=$env_profile; profile_src="CLAUDE_LOCAL_PROFILE"
 elif [ -n "$saved_profile" ]; then profile=$saved_profile; profile_src="saved default"
-else profile=fast; profile_src="built-in"; fi
+else profile=$class_default; profile_src="built-in for this Mac"; fi
 if [ -n "$opt_vision" ]; then vision=$opt_vision; vision_src="option"
 elif [ -n "$env_vision" ]; then vision=$env_vision; vision_src="CLAUDE_LOCAL_VISION"
 elif [ -n "$saved_vision" ]; then vision=$saved_vision; vision_src="saved default"
 else vision=off; vision_src="built-in"; fi
 
-# One row per model and vision setting: model folder, served alias, the
-# context window Claude Code plans for (measured with
-# install-claude-local.sh --memory-test), max output tokens, and extra
-# Claude Code settings. Vision rows are symlinks to the same weights,
-# served by oMLX's vision engine.
-profile_row() {  # profile_row <profile> <vision>
-  caps=""
-  case "$1:$2" in
-    fast:off)    dir=Qwen3.6-35B-A3B-UD-MLX-4bit;        alias=qwen3.6-35b-a3b;        row_ctx=131072; row_out=32000 ;;
-    fast:on)     dir=Qwen3.6-35B-A3B-UD-MLX-4bit-vision; alias=qwen3.6-35b-a3b-vision; row_ctx=106496; row_out=32000 ;;
-    quality:off) dir=Qwen3.8-27B-oQ4e-mtp;               alias=qwen3.8-27b;            row_ctx=94208;  row_out=20000
-                 caps="-mid_conv_system" ;;
-    quality:on)  dir=Qwen3.8-27B-oQ4e-mtp-vision;        alias=qwen3.8-27b-vision;     row_ctx=81920;  row_out=20000
-                 caps="-mid_conv_system" ;;
-  esac
-}
-installed() { [ -f "$OMLX_HOME/models/$1/config.json" ]; }
-
-# Why the model for the current row isn't usable, as a hint for the user.
-missing_hint() {
-  case "$dir" in
-    *-vision) if installed "${dir%-vision}"; then
-                echo "its vision variant (~/.omlx/models/$dir) is missing; re-run install-claude-local.sh to create it"
-                return
-              fi ;;
-  esac
-  case "$profile" in
-    quality) echo "the quality model is not installed; run install-claude-local.sh --with-quality" ;;
-    *) echo "the fast model is not installed; run install-claude-local.sh" ;;
-  esac
-}
-
 if [ "$cmd" = "set-default" ]; then
-  [ -n "$opt_profile$opt_vision" ] || die "give --local-fast/--local-quality and/or --local-vision/--local-no-vision to save"
+  [ -n "$opt_profile$opt_vision" ] || die "give --local-fast/--local-quality/--local-laguna and/or --local-vision/--local-no-vision to save"
   # Save only what the options say; keep the other saved value. Environment
   # variables are never saved.
-  new_profile="${opt_profile:-${saved_profile:-fast}}"
+  new_profile="${opt_profile:-${saved_profile:-$class_default}}"
   new_vision="${opt_vision:-${saved_vision:-off}}"
+  profile=$new_profile
   profile_row "$new_profile" "$new_vision"
-  installed "$dir" || { profile=$new_profile; die "can't save that default: $(missing_hint)"; }
+  [ -n "$dir" ] || die "can't save that default: $why"
+  installed "$dir" || die "can't save that default: $(missing_hint)"
   mkdir -p "$(dirname "$DEFAULTS_FILE")"
   tmp=$(mktemp "$DEFAULTS_FILE.XXXXXX")
   {
@@ -163,6 +289,21 @@ if [ "$cmd" = "set-default" ]; then
 fi
 
 profile_row "$profile" "$vision"
+# A model without image input: an explicit --local-vision is an error; a
+# saved or environment vision=on is set aside for this model.
+if [ -z "$dir" ] && [ -n "$base" ] && [ "$vision" = "on" ]; then
+  [ "$vision_src" != "option" ] || [ "$cmd" = "status" ] || [ "$cmd" = "stop" ] \
+    || die "$why; drop --local-vision, or pick a model that has it"
+  if [ "$vision_src" != "option" ]; then
+    [ "$cmd" = "status" ] || warn "$why, so vision is off for this session (vision on came from the $vision_src)"
+    vision=off; vision_src="$vision_src, but $(label "$profile") has no image input"
+    profile_row "$profile" off
+  fi
+fi
+if [ -z "$base" ] && [ "$cmd" != "status" ] && [ "$cmd" != "stop" ]; then
+  die "no $profile model on this Mac: $why"
+fi
+
 backend="${CLAUDE_LOCAL_BACKEND:-omlx}"
 case "$backend" in
   omlx)
@@ -184,6 +325,7 @@ case "$backend" in
 esac
 model="${CLAUDE_LOCAL_MODEL:-$alias}"
 ctx="${CLAUDE_LOCAL_CTX:-$row_ctx}"
+[ -z "${CLAUDE_LOCAL_CTX:-}" ] || ctx_src="CLAUDE_LOCAL_CTX"
 max_out="${CLAUDE_LOCAL_MAX_OUT:-$row_out}"
 base_url="http://127.0.0.1:$port"
 # One pid file per port, so a test server on another port can't clobber it.
@@ -213,10 +355,13 @@ loaded_models() {
         2>/dev/null || true
 }
 
-# Two ~20 GB models cannot share 36 GB, and OrbStack's VM holds ~13 GB.
+# On the smaller Macs a second big process matters: OrbStack's VM can hold
+# ~13 GB, and other model servers compete for the same GPU memory.
 memory_warnings() {
-  if command -v orbctl >/dev/null 2>&1 && [ "$(orbctl status 2>/dev/null)" = "Running" ]; then
-    warn "OrbStack is running (its VM can hold ~13 GB). Stop it with 'orbctl stop' for best performance."
+  if [ "$class" = 16 ] || [ "$class" = 36 ]; then
+    if command -v orbctl >/dev/null 2>&1 && [ "$(orbctl status 2>/dev/null)" = "Running" ]; then
+      warn "OrbStack is running (its VM can hold many GB). Stop it with 'orbctl stop' for best performance."
+    fi
   fi
   if [ "$backend" != "ollama" ]; then
     local n
@@ -237,9 +382,9 @@ requests_in_flight() {
     | /usr/bin/jq -r '(.active_requests // 0) + (.waiting_requests // 0)' 2>/dev/null || echo "?"
 }
 
-# oMLX holds one model at a time here; switching models evicts the other.
-# last_access is set when a request starts, so a long generation can look
-# idle; the in-flight count covers that.
+# Switching models evicts the other one unless both fit in memory (only the
+# Qwen pair on the Studios). last_access is set when a request starts, so a
+# long generation can look idle; the in-flight count covers that.
 swap_warning() {
   [ "$backend" = "omlx" ] || return 0
   local other idle busy
@@ -247,9 +392,9 @@ swap_warning() {
   while read -r other idle; do
     [ -n "$other" ] && [ "$other" != "$model" ] || continue
     if [ "$busy" != "0" ] && [ "$busy" != "?" ]; then
-      warn "$other is serving a request right now, probably for another session; this launch will wait for it, then swap it out for $model."
+      warn "$other is serving a request right now, probably for another session; this launch will wait for it, and may swap it out for $model."
     elif [ "$idle" -ge 0 ] && [ "$idle" -lt 600 ]; then
-      warn "$other was used ${idle}s ago, probably by another session; this launch swaps it out for $model."
+      warn "$other was used ${idle}s ago, probably by another session; this launch may swap it out for $model."
     fi
   done <<EOF
 $(loaded_models)
@@ -337,33 +482,58 @@ ensure_server() {
 }
 
 show_status() {
-  local mark reserve
+  local mark reserve p v
   # Claude Code compacts at W - min(max output, 20000) - 13000 and refuses
   # to send past W - min(max output, 20000) - 3000.
   reserve=$(( max_out < 20000 ? max_out : 20000 ))
-  echo "model:      $profile ($profile_src) -> $model"
+  echo "model:      $profile ($profile_src) -> ${model:-none}"
   echo "vision:     $vision ($vision_src)"
-  echo "context:    $ctx (auto-compact ~$((ctx - reserve - 13000)), hard limit ~$((ctx - reserve - 3000))); max output $max_out"
+  if [ -n "$dir" ] || [ -n "${CLAUDE_LOCAL_MODEL:-}" ]; then
+    echo "context:    $ctx (auto-compact ~$((ctx - reserve - 13000)), hard limit ~$((ctx - reserve - 3000))); max output $max_out"
+    echo "            window: ${ctx_src:-built-in}"
+  elif [ -z "$base" ]; then
+    echo "context:    - (no $profile model on this Mac: $why)"
+  else
+    echo "context:    - ($why)"
+  fi
   if [ "$vision" = "off" ]; then
     echo "images:     off; reading image files is refused, and pasted images aren't seen by the model"
   fi
+  if [ "$lean" = "on" ]; then
+    echo "tools:      lean ($lean_src): Read, Edit, Write, Bash, Grep, Glob; no slash commands"
+  fi
+  echo "machine:    $class GB class ($class_src)"
   echo "backend:    $backend $base_url"
-  if server_has_model; then
+  if [ -n "$model" ] && server_has_model; then
     local loaded
     loaded=$(loaded_models | awk '{ printf "%s%s (idle %ss)", sep, $1, $2; sep = ", " }')
     echo "server:     up; loaded: ${loaded:-none}"
   else
-    echo "server:     down, or '$model' not listed"
+    echo "server:     down, or '${model:-}' not listed"
   fi
   echo "defaults:   $DEFAULTS_FILE$([ -r "$DEFAULTS_FILE" ] || echo ' (none saved)')"
   echo "claude:     $CLAUDE_BIN"
   echo "omlx:       $OMLX_CLI"
-  echo "installed:"
-  for p in fast quality; do
+  echo "models on this Mac:"
+  for p in fast quality laguna; do
     for v in off on; do
       profile_row "$p" "$v"
-      if installed "$dir"; then mark="installed    ctx $row_ctx"; else mark="not installed"; fi
-      printf '            %-8s vision %-4s %s\n' "$p" "$v" "$mark"
+      if [ -z "$base" ]; then
+        [ "$v" = "off" ] && printf '            %-8s %s\n' "$p" "not on this Mac: $why"
+        continue
+      fi
+      if [ -z "$dir" ]; then
+        mark="no image input"
+      elif installed "$dir"; then
+        case "$ctx_src" in
+          "set for this Mac"*) mark="installed      ctx $row_ctx (this Mac)" ;;
+          "measured"*) mark="installed      ctx $row_ctx (measured)" ;;
+          *) mark="installed      ctx $row_ctx (estimate)" ;;
+        esac
+      else
+        mark="not installed"
+      fi
+      printf '            %-8s vision %-4s %-27s %s\n' "$p" "$v" "$alias" "$mark"
     done
   done
   profile_row "$profile" "$vision"
@@ -424,8 +594,8 @@ export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$ctx" CLAUDE_CODE_MAX_OUTPUT_TOKENS="$max
 # Keep the prompt prefix stable so the server's prefix cache hits.
 export CLAUDE_CODE_ATTRIBUTION_HEADER=0 CLAUDE_CODE_TOTAL_TOKENS_REMINDER=off
 
-# Qwen3.8's chat template rejects system messages after the first one, and
-# oMLX then moves them to the front, which breaks the prefix cache.
+# Most of these models' chat templates reject system messages after the first
+# one, and oMLX then moves them to the front, which breaks the prefix cache.
 [ -z "$caps" ] || export CLAUDE_CODE_MODEL_CAPABILITIES="$caps"
 
 # Compatibility with a non-Anthropic backend.
@@ -444,21 +614,37 @@ export CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS=600000
 
 is_subcommand "${1:-}" && exec "$CLAUDE_BIN" "$@"
 
-# WebSearch is an Anthropic server-side tool; LSP schema changes break the
-# prefix cache.
+# Lean: a smaller tool set cuts Claude Code's prompt from ~16K to ~4.5K
+# tokens, which a slow Mac needs minutes to process on every cache miss.
+if [ "$lean" = "on" ]; then
+  set -- --tools=Read,Edit,Write,Bash,Grep,Glob --disable-slash-commands "$@"
+fi
+
+# Without vision the server drops images silently. A hook on the Read tool
+# refuses image files with a clear message instead. (Deny rules would also
+# hide image files from Glob and Grep.) The reason must not contain a quote.
 if [ "$vision" = "off" ]; then
-  # Without vision the server drops images silently. A hook on the Read tool
-  # refuses image files with a clear message instead. (Deny rules would also
-  # hide image files from Glob and Grep.)
-  image_hook=$(cat <<'HOOK'
-/usr/bin/jq -r '.tool_input.file_path // empty' | /usr/bin/grep -qiE '[.](png|jpe?g|gif|webp)$' || exit 0
-printf '%s\n' '{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": "Image input is off in this claude-local session, so image files cannot be viewed. There is no workaround: do not try to decode, OCR or convert images with shell commands or scripts. Tell the user to relaunch with claude-local --local-vision."}}'
-HOOK
-)
+  if [ -n "$vision_ctx" ]; then
+    how="Tell the user to relaunch with claude-local --local-vision."
+  else
+    catalog fast
+    if [ -n "$vision_ctx" ]; then
+      how="This model has no image input; tell the user to relaunch with claude-local --local-fast --local-vision."
+    else
+      how="No model on this Mac has image input."
+    fi
+  fi
+  reason="Image input is off in this claude-local session, so image files cannot be viewed. There is no workaround: do not try to decode, OCR or convert images with shell commands or scripts. $how"
+  deny=$(/usr/bin/jq -cn --arg r "$reason" \
+    '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $r}}')
+  image_hook="/usr/bin/jq -r '.tool_input.file_path // empty' | /usr/bin/grep -qiE '[.](png|jpe?g|gif|webp)\$' || exit 0
+printf '%s\n' '$deny'"
   hook_settings=$(/usr/bin/jq -cn --arg c "$image_hook" \
     '{hooks: {PreToolUse: [{matcher: "Read", hooks: [{type: "command", command: $c}]}]}}')
-  exec "$CLAUDE_BIN" --strict-mcp-config --exclude-dynamic-system-prompt-sections \
-    --disallowedTools=WebSearch,LSP "--settings=$hook_settings" "$@"
+  set -- "--settings=$hook_settings" "$@"
 fi
+
+# WebSearch is an Anthropic server-side tool; LSP schema changes break the
+# prefix cache.
 exec "$CLAUDE_BIN" --strict-mcp-config --exclude-dynamic-system-prompt-sections \
   --disallowedTools=WebSearch,LSP "$@"

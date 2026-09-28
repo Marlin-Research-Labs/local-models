@@ -1,8 +1,24 @@
 # local-models
 
-`claude-local` runs Claude Code against a local open-weight model on an Apple Silicon Mac, served by oMLX: Qwen3.6-35B-A3B by default, or the slower, stronger Qwen3.8-27B, either with or without image input. The normal `claude` command, its login, settings and history are unaffected, and the install needs no admin rights.
+`claude-local` runs Claude Code against a local open-weight model on an Apple Silicon Mac, served by oMLX. The normal `claude` command, its login, settings and history are unaffected, and the install needs no admin rights.
 
-Tested on a MacBook Pro with an M5 Max (32-core GPU) and 36 GB, running macOS 27.0 and Claude Code 2.1.283. It needs Apple Silicon, at least 36 GB of memory and macOS 15 or later.
+It picks models for the Mac's memory. Each Mac has up to three models:
+- **fast:** Qwen, a mixture-of-experts model; the default on the MacBooks.
+- **quality:** Qwen3.8-27B, slower but stronger.
+- **laguna:** Poolside's Laguna, trained for long agentic coding sessions; the default on the Mac Studios.
+
+The Qwen models can take image input.
+
+| Mac (memory class) | fast | quality | laguna | Status |
+|---|---|---|---|---|
+| 16–35 GB (MacBook Air M2 16 GB) | Qwen3.5-9B, 4-bit fp16, 64K, text only | — | — (doesn't fit) | Not yet tested on the Air; windows are estimates |
+| 36–95 GB (MacBook Pro M5 Max 36 GB) | Qwen3.6-35B-A3B, 4-bit, 128K | Qwen3.8-27B, 4-bit, 92K | Laguna XS 2.1, 4-bit, 112K | **Tested** |
+| 96–127 GB (Mac Studio M3 Ultra 96 GB) | Qwen3.6-35B-A3B, 6-bit, 256K | Qwen3.8-27B, 6-bit, 128K | Laguna S 2.1, 4-bit, 128K (the default) | **Tested** |
+| 128 GB and up (Mac Studio M4 Max 128 GB) | as for 96 GB, 256K | as for 96 GB, 128K | as for 96 GB, 192K (the default) | Not yet tested; windows are estimates |
+
+Context windows are shown in thousands of tokens.
+
+It needs Apple Silicon, 16 GB of memory or more, macOS 15 or later (26 or later on a 16 GB Mac, for its larger GPU budget), and Claude Code's native install. Tested with macOS 27.0, Claude Code 2.1.283 and oMLX 0.7.0rc1.
 
 ## Install
 
@@ -14,26 +30,31 @@ cd local-models
 
 | Command | What it does |
 |---|---|
-| `./install-claude-local.sh` | The fast model, then the checks |
-| `./install-claude-local.sh --with-quality` | Also the quality model (17 GB more); can be added later |
-| `./install-claude-local.sh --memory-test` | Also test every installed model at full context |
+| `./install-claude-local.sh` | The fast model and this Mac's default (Laguna on 96 GB and up), then the checks |
+| `./install-claude-local.sh --with-quality` | Also the quality model (17–24 GB); can be added later |
+| `./install-claude-local.sh --with-laguna` | Also Laguna on a 36 GB Mac (20 GB) |
+| `./install-claude-local.sh --with-all` | Every model this Mac can run |
+| `./install-claude-local.sh --memory-test` | Also test every installed model at its full window, stepping down until one fits, and record the result for this Mac |
 
-The script is safe to re-run. [INSTALL.md](INSTALL.md) has the same steps done by hand, a sizing guide for other Macs, troubleshooting and updating.
+The script is safe to re-run. [INSTALL.md](INSTALL.md) has the same steps done by hand, a sizing guide, troubleshooting and updating. On a Mac whose windows are estimates, run `--memory-test` once.
 
 ## Use
 
 | Command | What it does |
 |---|---|
-| `claude-local` | Fast model, text only (the default); same flags as claude |
-| `claude-local --local-vision` | Fast model with image input |
-| `claude-local --local-quality` | Qwen3.8-27B: slower, stronger |
-| `claude-local --local-quality --local-vision` | Qwen3.8-27B with image input |
+| `claude-local` | This Mac's default model, text only; same flags as claude |
+| `claude-local --local-fast` | The fast model |
+| `claude-local --local-quality` | The quality model |
+| `claude-local --local-laguna` | Laguna (text only) |
+| `claude-local --local-vision` | Add image input to a Qwen model, e.g. `--local-fast --local-vision` |
 | `claude-local -p "question"` | Print mode; wrapper options always go first |
-| `claude-local --local-quality --local-set-default` | Save a different default |
-| `claude-local --local-status` | Selection, server, installed models, memory warnings |
+| `claude-local --local-quality --local-set-default` | Save a different default for this Mac |
+| `claude-local --local-status` | This Mac's models and windows, the selection, the server, memory warnings |
 | `claude-local --local-start` | Load the selected model ahead of time |
 | `claude-local --local-stop` | Stop the server and free the model's memory |
 | `claude-local --local-help` | Show the wrapper's options |
+
+Measured on the MacBook Pro (M5 Max, 36 GB):
 
 | Choice | Context window | Generation | Prompt processing |
 |---|---|---|---|
@@ -41,10 +62,29 @@ The script is safe to re-run. [INSTALL.md](INSTALL.md) has the same steps done b
 | fast + vision | 104K | ~70–90 tok/s | ~1,900 tok/s |
 | quality | 92K | ~20–45 tok/s | ~450–550 tok/s |
 | quality + vision | 80K | ~20–45 tok/s | ~530 tok/s |
+| laguna (XS 2.1) | 112K | ~80–100 tok/s | ~1,300–1,400 tok/s |
 
-`CLAUDE_LOCAL_PROFILE=fast|quality` and `CLAUDE_LOCAL_VISION=on|off` also choose, per command or per shell. Precedence is option, then environment, then the saved default in `~/.config/claude-local/defaults` (or `$XDG_CONFIG_HOME/claude-local/defaults` if you set that), then fast with vision off.
+Measured on the Mac Studio (M3 Ultra, 80-core GPU, 96 GB):
 
-The first launch starts the server and loads the model (about 10–15 s). Only one model fits in memory, so switching loads the other one, and `claude-local` warns if another session used a different model in the last 10 minutes. Models unload after 30 minutes idle. For best performance, stop OrbStack first (`orbctl stop`).
+| Choice | Context window | Generation | Prompt processing |
+|---|---|---|---|
+| laguna (S 2.1, the default) | 128K | ~65 tok/s | ~510 tok/s at 104K |
+| fast (6-bit) | 256K | ~185 tok/s | ~750 tok/s at 224K |
+| fast + vision | 256K | slower: no multi-token prediction | ~820 tok/s at 224K |
+| quality (6-bit) | 128K | ~75 tok/s | ~300 tok/s at 104K |
+| quality + vision | 128K | slower: no multi-token prediction | ~310 tok/s at 104K |
+
+Generation was measured writing code at short context. The Qwen models draft several tokens per step with their multi-token-prediction heads, which the vision variants don't use. In the agentic test (INSTALL.md step 8e), Laguna S took 4 turns and 54 s, the fast model 6 turns and 34 s, and the quality model 4 turns and 60 s.
+
+`CLAUDE_LOCAL_PROFILE=fast|quality|laguna` and `CLAUDE_LOCAL_VISION=on|off` also choose, per command or per shell. Precedence:
+1. the option;
+2. the environment;
+3. the saved default, in `~/.config/claude-local/defaults` (or `$XDG_CONFIG_HOME/claude-local/defaults` if you set that);
+4. this Mac's built-in default, with vision off.
+
+If a saved or environment setting turns vision on for Laguna, which has no image input, that session runs with vision off. The `--local-vision` option with Laguna is an error.
+
+The first launch starts the server and loads the model: 10–15 s for the Qwen models, longer for Laguna S. On the MacBooks only one model fits in memory, so switching loads the other one; on the Studios the two Qwen models fit together, but Laguna S needs the memory to itself. `claude-local` warns if another session used a different model in the last 10 minutes. Models unload after 30 minutes idle. On the 16 and 36 GB Macs, stop OrbStack first for best performance (`orbctl stop`).
 
 ## What is installed
 
@@ -54,24 +94,66 @@ The first launch starts the server and loads the model (about 10–15 s). Only o
 | Claude Code profile for local sessions | `~/.claude-local/` (settings, history, sessions). `CLAUDE.md` is a symlink to `~/.claude/CLAUDE.md` |
 | Inference server | oMLX 0.7.0rc1, `~/Applications/oMLX.app`, run headless by the wrapper on `127.0.0.1:8765` |
 | Server config | `~/.omlx/settings.json`, `~/.omlx/model_settings.json` |
-| Models | `~/.omlx/models/Qwen3.6-35B-A3B-UD-MLX-4bit` (Unsloth dynamic 4-bit, 21.7 GB) and, with `--with-quality`, `~/.omlx/models/Qwen3.8-27B-oQ4e-mtp` (17.0 GB). Each has a `-vision` symlink served by oMLX's vision engine. |
+| Models | Under `~/.omlx/models/`, one folder per model; see `claude-local --local-status`. Each Qwen model has a `-vision` symlink served by oMLX's vision engine. |
 | Saved defaults | `~/.config/claude-local/defaults` (or `$XDG_CONFIG_HOME/claude-local/defaults` if you set that), only after `--local-set-default` |
-| Prompt cache and logs | `~/.omlx/cache` (capped at 50 GB), `~/.omlx/logs/claude-local-server.log` |
+| Windows measured on this Mac | `~/.config/claude-local/windows`, written by `--memory-test` only where they differ from the built-in ones |
+| Prompt cache and logs | `~/.omlx/cache` (capped at 20 GB on 16 GB Macs, 50 GB on 36 GB, 300 GB on the Studios), `~/.omlx/logs/claude-local-server.log` |
 
 The install uses no admin rights and changes nothing in `~/.claude`, `~/.claude.json`, shell startup files or launchd.
 
 ## Configuration choices
 
-- **Fast model:** Qwen3.6-35B-A3B, a mixture-of-experts model with 3B active parameters. It was the best balance of speed and quality that fits in 36 GB.
-- **Quality model:** Qwen3.8-27B (dense). Its vendor benchmarks are well ahead (SWE-bench Pro 61.7 against 49.5), not yet independently reproduced. It generates 2–4× slower, and fits less context because its attention cache is 3.2× larger per token. It uses Qwen's thinking-mode sampling (temperature 1.0), `reasoning_effort` medium (its default `xhigh` can think for minutes) and its multi-token-prediction head. It also needs one undocumented Claude Code setting, because its chat template rejects mid-conversation system messages.
-- **Quantization:** Unsloth UD-MLX-4bit instead of uniform 4-bit, because it measures roughly 3× closer to full precision.
-- **Vision:** off by default, because the vision engine costs 1.1–2.3 GB of memory and so a smaller context window. With vision off, oMLX drops images silently. `claude-local` therefore refuses Claude Code's Read tool on image files, with a message telling the model to suggest `--local-vision`; Glob and Grep still list image files.
-- **Context:** each model and vision setting has its own measured window (table above). Claude Code auto-compacts about 33K below the window and never sends more than about 23K below it. Its own prompt and tools use about 16K.
-- **Memory:** each window was tested cold with the largest prompt Claude Code sends at it, and every one peaked at about 26 GB against the 28.1 GB GPU limit. That needs oMLX's `aggressive` memory guard.
-- **Sampling (fast model):** Qwen's settings for precise coding: temperature 0.6, top_p 0.95, top_k 20. Thinking is on and preserved across turns for both models.
+- **Machine classes:** macOS lets the GPU use a fixed share of memory (measured: 28.1 GiB of 36 GB, 77.8 GiB of 96 GB; reported: about 11.8 GiB of 16 GB on macOS 26, about 96–107 GiB of 128 GB). That budget decides which models fit and how much context. `claude-local` reads the Mac's memory size on each launch; `CLAUDE_LOCAL_MACHINE=16|36|96|128` overrides it.
+- **Fast model:**
+  - Qwen3.6-35B-A3B, a mixture-of-experts model with 3B active parameters and the best balance of speed and quality that fits in 36 GB.
+  - On the MacBook Pro it is Unsloth's UD-MLX-4bit, which measures roughly 3× closer to full precision than uniform 4-bit.
+  - On the Studios it is oMLX's 6-bit oQ6-mtp. Its multi-token-prediction head makes it the fastest model here, about 185 tok/s on the M3 Ultra.
+  - On a 16 GB Mac it is Qwen3.5-9B, the strongest Qwen that fits. The fp16 build matters because M1 and M2 GPUs emulate bf16.
+- **Quality model:** Qwen3.8-27B (dense), 4-bit on the MacBook Pro and 6-bit on the Studios.
+  - Its vendor benchmarks are well ahead (SWE-bench Pro 61.7 against 49.5, run in Claude Code), not yet independently reproduced.
+  - It generates 2–4× slower, and fits less context because its attention cache is 3.2× larger per token.
+  - It uses Qwen's thinking-mode sampling (temperature 1.0), `reasoning_effort` medium (its default `xhigh` can think for minutes) and its multi-token-prediction head.
+- **Laguna:** see the section below.
+- **Mid-conversation system messages:** most of these models' chat templates reject them, and oMLX's fallback moves them, which breaks the prompt cache. `claude-local` turns them off for every model except the MacBook Pro's fast model (`CLAUDE_CODE_MODEL_CAPABILITIES=-mid_conv_system`, undocumented).
+- **Vision:** off by default, because the vision engine costs 1–2 GB of memory and so a smaller context window. With vision off, oMLX drops images silently. `claude-local` therefore refuses Claude Code's Read tool on image files, with a message telling the model how to relaunch; Glob and Grep still list image files.
+- **Context:** each model and vision setting has its own window.
+  - Claude Code auto-compacts about 33K below the window and never sends more than about 23K below it. Its own prompt and tools use about 16K.
+  - Windows marked tested were run cold at that size, with the largest prompt Claude Code sends there.
+  - `--memory-test` repeats that on any Mac, stepping down 8–16K at a time until a window fits, and records the result.
+- **Memory:** oMLX's `aggressive` memory guard on every class. It admits a request up to 95% of the GPU budget and rejects prompts that wouldn't fit, instead of crashing.
+- **16 GB Macs:** lean mode is on by default. It trims Claude Code's tools to Read, Edit, Write, Bash, Grep and Glob, with no slash commands.
+  - That cuts Claude Code's prompt from about 16K tokens to about 4.5K, which an M2 needs about 30 s rather than 2 minutes to process cold.
+  - Output is capped at 8K tokens so the 64K window still leaves room to work.
+  - `CLAUDE_LOCAL_LEAN=off` restores the full tool set.
+- **Sampling:** Qwen's settings for precise coding on the fast models (temperature 0.6, top_p 0.95, top_k 20), Qwen's thinking settings on the quality model, and Poolside's settings on Laguna (temperature 1.0, top_p 1.0, top_k 20). Thinking is on for every model.
 - **Permission mode:** the default permission mode is normal prompting, not auto mode, because auto mode's safety checks would be judged by the local model.
 - **Disabled tools:** WebSearch is disabled because it runs on Anthropic's servers. The claude.ai connectors and MCP servers are also off; pass `--mcp-config <file>` to add servers.
-- **Speed:** see the table above. Repeat turns reuse the prompt cache (about 98% hits for both models).
+- **Speed:** see the tables above. Repeat turns reuse the prompt cache (about 98% hits for the MacBook Pro's Qwen models).
+
+## Laguna
+
+[Laguna](https://poolside.ai/blog/introducing-laguna-s-2-1) is Poolside's family of open-weight coding models, trained for long agentic sessions (OpenMDW license).
+
+| | Laguna XS 2.1 (36 GB Macs) | Laguna S 2.1 (96 GB and up) |
+|---|---|---|
+| Size | 33B total, 3B active; 19.5 GB at 4-bit (`mlx-coders/Laguna-XS-2.1-oQ4e`) | 118B total, 8B active; 63 GB at 4-bit (`mlx-community/Laguna-S-2.1-oQ4e-fast`) |
+| Native context | 262K | 1M (the Studios use 128–192K; a cold 128K prompt takes minutes) |
+| Published scores (Poolside's own harness) | SWE-bench Verified 70.9, SWE-bench Pro 47.6, Terminal-Bench 2.0 37.5 | SWE-bench Pro 59.4, SWE-bench Multilingual 78.5, Terminal-Bench 2.1 70.2 |
+| Compared with the Qwen models here | Below Qwen3.6-35B-A3B on every published coding benchmark (73.4 / 49.5 / 51.5) | Roughly level with Qwen3.8-27B (SWE-bench Pro 61.7), which was measured in Claude Code itself |
+
+How `claude-local` runs it, and what to know:
+- **Text only.** Laguna has no image input.
+- **Chat template:** for XS 2.1, the installer replaces the model's `chat_template.jinja` with Poolside's Laguna S 2.1 template. It is the same format plus a `preserve_thinking` flag. Without the flag, oMLX pastes earlier thinking into the message text and the conversation history renders malformed.
+- **Whitespace in tool calls (oMLX 0.7.0rc1 bug):** oMLX's Laguna tool parser strips leading and trailing whitespace from every string argument. So:
+  - an Edit that only changes indentation arrives with identical old and new strings, and fails;
+  - an Edit that deletes a line through a trailing newline leaves a blank line;
+  - Write drops a file's final newline.
+  - Most edits still work, because the stripped strings still match. Qwen models are not affected.
+  - In a test on the MacBook Pro, Laguna XS's Write dropped the final newline, while its indentation Edit worked because the model included the line above it.
+  - In the coding test, both Laguna models passed in 4 turns, like the quality model.
+- **Speculative decoding (DFlash)** is off. oMLX supports it for Laguna, but it is slower than normal decoding at Claude Code's prompt lengths.
+- **Thinking** is on, with no effort control. Poolside lists overthinking as a known limitation, and output is capped at 32K tokens per reply.
+- **Harness fit:** Poolside notes that the model is tuned to its own agent harness and can struggle with other harnesses' tool definitions at first. Try it on real tasks next to the Qwen models before relying on it.
 
 ## Compared with `ollama launch claude`
 
@@ -142,10 +224,12 @@ Inference is local, but any organization-managed Claude Code settings still appl
 
 For experiments, set these per invocation, for example `CLAUDE_LOCAL_CTX=65536 claude-local`:
 
-- `CLAUDE_LOCAL_CTX`: context window (default: the chosen model's measured window)
-- `CLAUDE_LOCAL_MAX_OUT`: max output tokens (default 32000 for fast, 20000 for quality)
+- `CLAUDE_LOCAL_CTX`: context window (default: the chosen model's window for this Mac)
+- `CLAUDE_LOCAL_MAX_OUT`: max output tokens (default 32000; 20000 for quality; 8192 on 16 GB Macs)
 - `CLAUDE_LOCAL_MODEL`: a served model name, overriding the chosen one
 - `CLAUDE_LOCAL_PORT`: server port (default 8765)
+- `CLAUDE_LOCAL_LEAN=on|off`: the trimmed tool set (default on for 16 GB Macs only)
+- `CLAUDE_LOCAL_MACHINE=16|36|96|128`: the memory class (default: from the Mac's memory)
 - `CLAUDE_LOCAL_BACKEND=ollama`: fallback to Ollama with `qwen3.6:35b-a3b-coding-nvfp4` (fast model, no vision). It is wired up, but the installed Ollama 0.30.10 misbehaved in testing, so update Ollama before relying on it.
 
 ## Uninstall
@@ -166,9 +250,9 @@ If oMLX was set up on the Mac before `claude-local`, keep `~/.omlx` and restore 
 |---|---|
 | `install-claude-local.sh` | The installer. **Generated.** |
 | `INSTALL.md` | The manual install guide. **Generated.** |
-| `src/claude-local` | The wrapper that the installer puts in `~/.local/bin` |
-| `src/model_settings.json` | oMLX per-model settings for both models and their vision variants |
+| `src/claude-local` | The wrapper that the installer puts in `~/.local/bin`. Its `catalog` table lists every model for every class of Mac. |
+| `src/model_settings.json` | oMLX per-model settings for every model and vision variant |
 | `src/INSTALL.md.in`, `src/install-claude-local.sh.in` | Templates for the generated files |
 | `scripts/build.py` | Regenerates the generated files from `src/` |
 
-The generated files embed the wrapper and model settings verbatim, so edit `src/` and run `python3 scripts/build.py` rather than editing them directly. `python3 scripts/build.py --check` fails if they are out of date.
+The generated files embed the wrapper and model settings verbatim, so edit `src/` and run `python3 scripts/build.py` rather than editing them directly. The build also checks that every model in the catalog has oMLX settings. `python3 scripts/build.py --check` fails if the generated files are out of date.
