@@ -14,23 +14,22 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "src"
-MODEL_DIR_NAME = "Qwen3.6-35B-A3B-UD-MLX-4bit"
-HEREDOC_MARKERS = ("CLAUDE_LOCAL_SCRIPT", "MODEL_ENTRY")
+HEREDOC_MARKERS = ("CLAUDE_LOCAL_SCRIPT", "MODEL_ENTRIES")
 
 
 def render() -> dict[str, str]:
     wrapper = (SRC / "claude-local").read_text().rstrip("\n")
     model_settings = (SRC / "model_settings.json").read_text().rstrip("\n")
-    entry = json.loads(model_settings)["models"][MODEL_DIR_NAME]
+    entries = json.loads(model_settings)["models"]
     for marker in HEREDOC_MARKERS:
-        if marker in wrapper:
-            sys.exit(f"src/claude-local must not contain the heredoc marker {marker}")
+        if marker in wrapper or marker in model_settings:
+            sys.exit(f"src/ must not contain the heredoc marker {marker}")
 
     guide = (SRC / "INSTALL.md.in").read_text()
     guide = guide.replace("@@WRAPPER@@", wrapper).replace("@@MODEL_SETTINGS@@", model_settings)
     installer = (SRC / "install-claude-local.sh.in").read_text()
     installer = installer.replace("@@WRAPPER@@", wrapper)
-    installer = installer.replace("@@MODEL_ENTRY@@", json.dumps(entry, indent=2))
+    installer = installer.replace("@@MODEL_ENTRIES@@", json.dumps(entries, indent=2))
     return {"INSTALL.md": guide, "install-claude-local.sh": installer}
 
 

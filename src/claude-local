@@ -1,8 +1,11 @@
 #!/bin/bash
 # claude-local: run Claude Code against a local open-weight model.
 #
-# Default backend: oMLX (~/Applications/oMLX.app) serving Qwen3.6-35B-A3B
-# (Unsloth UD-MLX-4bit) on http://127.0.0.1:8765. Fallback backend: Ollama.
+# Models, served by oMLX (~/Applications/oMLX.app) on http://127.0.0.1:8765:
+#   fast     Qwen3.6-35B-A3B (Unsloth UD-MLX-4bit), the default
+#   quality  Qwen3.8-27B (oMLX oQ4e-mtp), slower but stronger; install it with
+#            install-claude-local.sh --with-quality
+# Either model can run with image input (vision) on or off (the default).
 #
 # Everything here is scoped to this process. It never edits ~/.claude,
 # ~/.claude.json, shell rc files or launchd, so the normal `claude` command
@@ -12,18 +15,22 @@
 # Org-managed settings (MintMCP hooks, OTEL telemetry) still apply here by
 # design; nothing in this script bypasses them.
 #
-# Wrapper-only commands (first argument):
-#   --local-status   show server, model and memory warnings
-#   --local-start    start the server and load the model, then exit
-#   --local-stop     stop the oMLX server started by claude-local
-#   --local-help     show this help
+# Wrapper options (they must come before any Claude Code arguments):
+#   --local-fast | --local-quality       choose the model (default: fast)
+#   --local-vision | --local-no-vision   image input on or off (default: off)
+#   --local-set-default   save the model and vision options given, then exit
+#   --local-status        show the selection, the server and installed models
+#   --local-start         start the server and load the selected model, then exit
+#   --local-stop          stop the oMLX server started by claude-local
+#   --local-help          show this help
 #
-# Overrides (environment, per invocation):
-#   CLAUDE_LOCAL_BACKEND  omlx (default) | ollama
-#   CLAUDE_LOCAL_MODEL    model id served by the backend
-#   CLAUDE_LOCAL_PORT     backend port (oMLX 8765, Ollama 11434)
-#   CLAUDE_LOCAL_CTX      context window Claude Code plans for (default 131072)
-#   CLAUDE_LOCAL_MAX_OUT  max output tokens per response (default 32000)
+# Environment, per invocation: CLAUDE_LOCAL_PROFILE=fast|quality and
+# CLAUDE_LOCAL_VISION=on|off. For experiments: CLAUDE_LOCAL_MODEL (served model
+# id), CLAUDE_LOCAL_CTX, CLAUDE_LOCAL_MAX_OUT, CLAUDE_LOCAL_PORT and
+# CLAUDE_LOCAL_BACKEND=omlx|ollama.
+#
+# Precedence: option > environment > saved default > built-in. Saved defaults
+# live in ~/.config/claude-local/defaults (or $XDG_CONFIG_HOME/claude-local).
 
 set -euo pipefail
 
@@ -41,30 +48,149 @@ OMLX_APP="$HOME/Applications/oMLX.app"
 OMLX_CLI="$OMLX_APP/Contents/MacOS/omlx-cli"
 OMLX_HOME="$HOME/.omlx"
 OMLX_LOG="$OMLX_HOME/logs/claude-local-server.log"
-OMLX_PIDFILE="$OMLX_HOME/claude-local-server.pid"
 LOCAL_CONFIG_DIR="$HOME/.claude-local"
+DEFAULTS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-local/defaults"
 
+# --- Wrapper options: a leading run of --local-* arguments ------------------
+opt_profile=""
+opt_vision=""
+cmd=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --local-fast) opt_profile=fast ;;
+    --local-quality) opt_profile=quality ;;
+    --local-vision) opt_vision=on ;;
+    --local-no-vision) opt_vision=off ;;
+    --local-status|--local-start|--local-stop|--local-help|--local-set-default)
+      [ -z "$cmd" ] || die "one of --local-status/start/stop/help/set-default at a time"
+      cmd="${1#--local-}" ;;
+    --local-*) echo "claude-local: unknown option '$1' (see claude-local --local-help)" >&2; exit 2 ;;
+    *) break ;;
+  esac
+  shift
+done
+
+if [ "$cmd" = "help" ]; then
+  awk 'NR > 1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0"
+  exit 0
+fi
+
+# --- Resolve model and vision ------------------------------------------------
+saved_profile=""
+saved_vision=""
+if [ -r "$DEFAULTS_FILE" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%%#*}              # drop comments
+    line=${line//[[:space:]]/}    # drop all whitespace, including CR
+    case "$line" in
+      "") ;;
+      profile=fast|profile=quality) saved_profile=${line#*=} ;;
+      vision=on|vision=off) saved_vision=${line#*=} ;;
+      *) warn "ignoring '$line' in $DEFAULTS_FILE (expected profile=fast|quality or vision=on|off)" ;;
+    esac
+  done < "$DEFAULTS_FILE"
+fi
+
+env_profile="${CLAUDE_LOCAL_PROFILE:-}"
+case "$env_profile" in ""|fast|quality) ;; *) die "CLAUDE_LOCAL_PROFILE must be fast or quality" ;; esac
+case "${CLAUDE_LOCAL_VISION:-}" in
+  "") env_vision="" ;;
+  on|1|yes|true) env_vision=on ;;
+  off|0|no|false) env_vision=off ;;
+  *) die "CLAUDE_LOCAL_VISION must be on or off" ;;
+esac
+
+# Remember where each choice came from, for --local-status.
+if [ -n "$opt_profile" ]; then profile=$opt_profile; profile_src="option"
+elif [ -n "$env_profile" ]; then profile=$env_profile; profile_src="CLAUDE_LOCAL_PROFILE"
+elif [ -n "$saved_profile" ]; then profile=$saved_profile; profile_src="saved default"
+else profile=fast; profile_src="built-in"; fi
+if [ -n "$opt_vision" ]; then vision=$opt_vision; vision_src="option"
+elif [ -n "$env_vision" ]; then vision=$env_vision; vision_src="CLAUDE_LOCAL_VISION"
+elif [ -n "$saved_vision" ]; then vision=$saved_vision; vision_src="saved default"
+else vision=off; vision_src="built-in"; fi
+
+# One row per model and vision setting: model folder, served alias, the
+# context window Claude Code plans for (measured with
+# install-claude-local.sh --memory-test), max output tokens, and extra
+# Claude Code settings. Vision rows are symlinks to the same weights,
+# served by oMLX's vision engine.
+profile_row() {  # profile_row <profile> <vision>
+  caps=""
+  case "$1:$2" in
+    fast:off)    dir=Qwen3.6-35B-A3B-UD-MLX-4bit;        alias=qwen3.6-35b-a3b;        row_ctx=131072; row_out=32000 ;;
+    fast:on)     dir=Qwen3.6-35B-A3B-UD-MLX-4bit-vision; alias=qwen3.6-35b-a3b-vision; row_ctx=106496; row_out=32000 ;;
+    quality:off) dir=Qwen3.8-27B-oQ4e-mtp;               alias=qwen3.8-27b;            row_ctx=94208;  row_out=20000
+                 caps="-mid_conv_system" ;;
+    quality:on)  dir=Qwen3.8-27B-oQ4e-mtp-vision;        alias=qwen3.8-27b-vision;     row_ctx=81920;  row_out=20000
+                 caps="-mid_conv_system" ;;
+  esac
+}
+installed() { [ -f "$OMLX_HOME/models/$1/config.json" ]; }
+
+# Why the model for the current row isn't usable, as a hint for the user.
+missing_hint() {
+  case "$dir" in
+    *-vision) if installed "${dir%-vision}"; then
+                echo "its vision variant (~/.omlx/models/$dir) is missing; re-run install-claude-local.sh to create it"
+                return
+              fi ;;
+  esac
+  case "$profile" in
+    quality) echo "the quality model is not installed; run install-claude-local.sh --with-quality" ;;
+    *) echo "the fast model is not installed; run install-claude-local.sh" ;;
+  esac
+}
+
+if [ "$cmd" = "set-default" ]; then
+  [ -n "$opt_profile$opt_vision" ] || die "give --local-fast/--local-quality and/or --local-vision/--local-no-vision to save"
+  # Save only what the options say; keep the other saved value. Environment
+  # variables are never saved.
+  new_profile="${opt_profile:-${saved_profile:-fast}}"
+  new_vision="${opt_vision:-${saved_vision:-off}}"
+  profile_row "$new_profile" "$new_vision"
+  installed "$dir" || { profile=$new_profile; die "can't save that default: $(missing_hint)"; }
+  mkdir -p "$(dirname "$DEFAULTS_FILE")"
+  tmp=$(mktemp "$DEFAULTS_FILE.XXXXXX")
+  {
+    echo "# claude-local saved defaults (claude-local --local-set-default); edit or delete freely"
+    echo "profile=$new_profile"
+    echo "vision=$new_vision"
+  } > "$tmp"
+  mv "$tmp" "$DEFAULTS_FILE"
+  echo "claude-local: saved default: $new_profile, vision $new_vision ($DEFAULTS_FILE)"
+  exit 0
+fi
+
+profile_row "$profile" "$vision"
 backend="${CLAUDE_LOCAL_BACKEND:-omlx}"
 case "$backend" in
   omlx)
     port="${CLAUDE_LOCAL_PORT:-8765}"
-    model="${CLAUDE_LOCAL_MODEL:-qwen3.6-35b-a3b}"
     token="local"
     ;;
   ollama)
+    [ "$profile:$vision" = "fast:off" ] || [ -n "${CLAUDE_LOCAL_MODEL:-}" ] \
+      || die "the Ollama backend only has the fast model without vision; set CLAUDE_LOCAL_MODEL"
     port="${CLAUDE_LOCAL_PORT:-11434}"
-    model="${CLAUDE_LOCAL_MODEL:-qwen3.6:35b-a3b-coding-nvfp4}"
+    alias="qwen3.6:35b-a3b-coding-nvfp4"
     token="ollama"
+    caps=""
     ;;
   *)
     echo "claude-local: unknown CLAUDE_LOCAL_BACKEND '$backend' (use omlx or ollama)" >&2
     exit 2
     ;;
 esac
+model="${CLAUDE_LOCAL_MODEL:-$alias}"
+ctx="${CLAUDE_LOCAL_CTX:-$row_ctx}"
+max_out="${CLAUDE_LOCAL_MAX_OUT:-$row_out}"
 base_url="http://127.0.0.1:$port"
-ctx="${CLAUDE_LOCAL_CTX:-131072}"
-max_out="${CLAUDE_LOCAL_MAX_OUT:-32000}"
+# One pid file per port, so a test server on another port can't clobber it.
+if [ "$port" = "8765" ]; then OMLX_PIDFILE="$OMLX_HOME/claude-local-server.pid"
+else OMLX_PIDFILE="$OMLX_HOME/claude-local-server-$port.pid"; fi
 
+# --- Server helpers ----------------------------------------------------------
 # True when the backend answers and lists $model.
 server_has_model() {
   curl -fsS -m 3 -H "Authorization: Bearer $token" "$base_url/v1/models" 2>/dev/null \
@@ -73,6 +199,18 @@ server_has_model() {
 
 port_listener_pid() {
   lsof -nP -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null | head -1 || true
+}
+
+is_omlx_pid() {
+  case "$(ps -o command= -p "$1" 2>/dev/null)" in *omlx*) return 0 ;; *) return 1 ;; esac
+}
+
+# Prints "<alias> <seconds since last use>" for each model oMLX has loaded.
+loaded_models() {
+  curl -fsS -m 3 -H "Authorization: Bearer $token" "$base_url/v1/models/status" 2>/dev/null \
+    | /usr/bin/jq -r --argjson now "$(date +%s)" \
+        '.models[]? | select(.loaded) | "\(.model_alias // .id) \(if .last_access then ($now - .last_access | floor) else -1 end)"' \
+        2>/dev/null || true
 }
 
 # Two ~20 GB models cannot share 36 GB, and OrbStack's VM holds ~13 GB.
@@ -91,6 +229,41 @@ memory_warnings() {
     [ "${m:-0}" -gt 0 ] && warn "LM Studio has $m model(s) loaded; unload them with 'lms unload --all'."
   fi
   return 0
+}
+
+# Requests the server is working on or has queued ("?" if it can't say).
+requests_in_flight() {
+  curl -fsS -m 3 -H "Authorization: Bearer $token" "$base_url/api/status" 2>/dev/null \
+    | /usr/bin/jq -r '(.active_requests // 0) + (.waiting_requests // 0)' 2>/dev/null || echo "?"
+}
+
+# oMLX holds one model at a time here; switching models evicts the other.
+# last_access is set when a request starts, so a long generation can look
+# idle; the in-flight count covers that.
+swap_warning() {
+  [ "$backend" = "omlx" ] || return 0
+  local other idle busy
+  busy=$(requests_in_flight)
+  while read -r other idle; do
+    [ -n "$other" ] && [ "$other" != "$model" ] || continue
+    if [ "$busy" != "0" ] && [ "$busy" != "?" ]; then
+      warn "$other is serving a request right now, probably for another session; this launch will wait for it, then swap it out for $model."
+    elif [ "$idle" -ge 0 ] && [ "$idle" -lt 600 ]; then
+      warn "$other was used ${idle}s ago, probably by another session; this launch swaps it out for $model."
+    fi
+  done <<EOF
+$(loaded_models)
+EOF
+  return 0
+}
+
+# Claude Code subcommands (mcp, doctor, update, ...) take no session flags
+# and need no model.
+is_subcommand() {
+  case "${1:-}" in
+    agents|attach|auth|auto-mode|doctor|gateway|import|install|logs|mcp|plugin|plugins|project|respawn|rm|setup-token|stop|kill|ultrareview|update|upgrade) return 0 ;;
+  esac
+  return 1
 }
 
 start_omlx() {
@@ -127,10 +300,7 @@ stop_omlx() {
     rm -f "$OMLX_PIDFILE"
     return 0
   fi
-  case "$(ps -o command= -p "$pid" 2>/dev/null)" in
-    *omlx*) ;;
-    *) die "pid $pid on port $port is not oMLX; not stopping it" ;;
-  esac
+  is_omlx_pid "$pid" || die "pid $pid on port $port is not oMLX; not stopping it"
   kill -TERM "$pid" 2>/dev/null || true
   local i=0
   while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 20 ]; do sleep 1; i=$((i + 1)); done
@@ -141,7 +311,7 @@ stop_omlx() {
 }
 
 # Ask the server to load the model now, so the first Claude Code turn
-# doesn't also pay the ~20 GB load time.
+# doesn't also pay the load time.
 warm_model() {
   curl -fsS -m 600 -H "Authorization: Bearer $token" -H "content-type: application/json" \
     -H "anthropic-version: 2023-06-01" "$base_url/v1/messages" \
@@ -149,43 +319,83 @@ warm_model() {
     >/dev/null
 }
 
-case "${1:-}" in
-  --local-help)
-    sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'
-    exit 0
-    ;;
-  --local-status)
-    echo "backend: $backend  url: $base_url  model: $model  context: $ctx  max output: $max_out"
-    echo "claude: $CLAUDE_BIN  omlx: $OMLX_CLI"
-    if server_has_model; then echo "server: up, '$model' available"; else echo "server: down or '$model' not listed"; fi
+# Make sure the requested model exists, and the server is up and lists it.
+ensure_server() {
+  if [ "$backend" = "omlx" ] && [ -z "${CLAUDE_LOCAL_MODEL:-}" ] && ! installed "$dir"; then
+    die "$(missing_hint)"
+  fi
+  server_has_model && return 0
+  [ "$backend" = "omlx" ] || die "Ollama is not serving '$model' at $base_url (is the Ollama app running?)"
+  local pid
+  pid=$(port_listener_pid)
+  if [ -n "$pid" ]; then
+    is_omlx_pid "$pid" \
+      && die "oMLX is running but doesn't list '$model'. Run 'claude-local --local-stop' so the next launch rescans its models."
+    die "port $port is in use by pid $pid, which isn't oMLX. Check it with: lsof -nP -iTCP:$port"
+  fi
+  start_omlx
+}
+
+show_status() {
+  local mark reserve
+  # Claude Code compacts at W - min(max output, 20000) - 13000 and refuses
+  # to send past W - min(max output, 20000) - 3000.
+  reserve=$(( max_out < 20000 ? max_out : 20000 ))
+  echo "model:      $profile ($profile_src) -> $model"
+  echo "vision:     $vision ($vision_src)"
+  echo "context:    $ctx (auto-compact ~$((ctx - reserve - 13000)), hard limit ~$((ctx - reserve - 3000))); max output $max_out"
+  if [ "$vision" = "off" ]; then
+    echo "images:     off; reading image files is refused, and pasted images aren't seen by the model"
+  fi
+  echo "backend:    $backend $base_url"
+  if server_has_model; then
+    local loaded
+    loaded=$(loaded_models | awk '{ printf "%s%s (idle %ss)", sep, $1, $2; sep = ", " }')
+    echo "server:     up; loaded: ${loaded:-none}"
+  else
+    echo "server:     down, or '$model' not listed"
+  fi
+  echo "defaults:   $DEFAULTS_FILE$([ -r "$DEFAULTS_FILE" ] || echo ' (none saved)')"
+  echo "claude:     $CLAUDE_BIN"
+  echo "omlx:       $OMLX_CLI"
+  echo "installed:"
+  for p in fast quality; do
+    for v in off on; do
+      profile_row "$p" "$v"
+      if installed "$dir"; then mark="installed    ctx $row_ctx"; else mark="not installed"; fi
+      printf '            %-8s vision %-4s %s\n' "$p" "$v" "$mark"
+    done
+  done
+  profile_row "$profile" "$vision"
+}
+
+case "$cmd" in
+  status)
+    show_status
     memory_warnings
     exit 0
     ;;
-  --local-stop)
+  stop)
     [ "$backend" = "omlx" ] || die "--local-stop only manages oMLX; quit Ollama from its menu-bar app"
     stop_omlx
     exit 0
     ;;
-  --local-start)
+  start)
     memory_warnings
-    if ! server_has_model; then
-      [ "$backend" = "omlx" ] || die "Ollama is not serving '$model' at $base_url"
-      start_omlx
-    fi
+    ensure_server
+    swap_warning
     echo "claude-local: loading '$model'..." >&2
     warm_model || die "the model failed to load; see $OMLX_LOG"
-    echo "claude-local: ready at $base_url"
+    echo "claude-local: ready at $base_url ($profile, vision $vision)"
     exit 0
     ;;
 esac
 
-memory_warnings
-if ! server_has_model; then
-  if [ "$backend" = "omlx" ]; then
-    start_omlx
-  else
-    die "Ollama is not serving '$model' at $base_url (is the Ollama app running?)"
-  fi
+if ! is_subcommand "${1:-}"; then
+  memory_warnings
+  ensure_server
+  swap_warning
+  [ -t 2 ] && echo "claude-local: $profile, vision $vision -> $model, context $ctx" >&2
 fi
 
 [ -d "$LOCAL_CONFIG_DIR" ] || mkdir -p "$LOCAL_CONFIG_DIR"
@@ -196,7 +406,7 @@ unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_PROFILE ANTHROPIC_BETA
   CLAUDE_CODE_USE_FOUNDRY CLAUDE_CODE_USE_MANTLE CLAUDE_CODE_USE_GATEWAY \
   CLAUDE_CODE_USE_ANTHROPIC_AWS CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD \
   CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT \
-  CLAUDE_CODE_AUTO_COMPACT_WINDOW CLAUDE_SECURESTORAGE_CONFIG_DIR
+  CLAUDE_CODE_AUTO_COMPACT_WINDOW CLAUDE_SECURESTORAGE_CONFIG_DIR CLAUDE_CODE_MODEL_CAPABILITIES
 
 # Isolated profile and local endpoint.
 export CLAUDE_CONFIG_DIR="$LOCAL_CONFIG_DIR"
@@ -214,6 +424,10 @@ export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$ctx" CLAUDE_CODE_MAX_OUTPUT_TOKENS="$max
 # Keep the prompt prefix stable so the server's prefix cache hits.
 export CLAUDE_CODE_ATTRIBUTION_HEADER=0 CLAUDE_CODE_TOTAL_TOKENS_REMINDER=off
 
+# Qwen3.8's chat template rejects system messages after the first one, and
+# oMLX then moves them to the front, which breaks the prefix cache.
+[ -z "$caps" ] || export CLAUDE_CODE_MODEL_CAPABILITIES="$caps"
+
 # Compatibility with a non-Anthropic backend.
 export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1 ENABLE_CLAUDEAI_MCP_SERVERS=false
 export CLAUDE_CODE_DISABLE_FAST_MODE=1 CLAUDE_CODE_AUTO_MODE_SERVER=0
@@ -228,13 +442,23 @@ export CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLAC
 export API_TIMEOUT_MS=3000000 CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS=1800000
 export CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS=600000
 
-# Claude Code subcommands (mcp, doctor, update, ...) take no session flags.
-case "${1:-}" in
-  agents|attach|auth|auto-mode|doctor|gateway|import|install|logs|mcp|plugin|plugins|project|respawn|rm|setup-token|stop|kill|ultrareview|update|upgrade)
-    exec "$CLAUDE_BIN" "$@"
-    ;;
-esac
+is_subcommand "${1:-}" && exec "$CLAUDE_BIN" "$@"
 
-# WebSearch is an Anthropic server-side tool; LSP schema changes break the prefix cache.
+# WebSearch is an Anthropic server-side tool; LSP schema changes break the
+# prefix cache.
+if [ "$vision" = "off" ]; then
+  # Without vision the server drops images silently. A hook on the Read tool
+  # refuses image files with a clear message instead. (Deny rules would also
+  # hide image files from Glob and Grep.)
+  image_hook=$(cat <<'HOOK'
+/usr/bin/jq -r '.tool_input.file_path // empty' | /usr/bin/grep -qiE '[.](png|jpe?g|gif|webp)$' || exit 0
+printf '%s\n' '{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": "Image input is off in this claude-local session, so image files cannot be viewed. There is no workaround: do not try to decode, OCR or convert images with shell commands or scripts. Tell the user to relaunch with claude-local --local-vision."}}'
+HOOK
+)
+  hook_settings=$(/usr/bin/jq -cn --arg c "$image_hook" \
+    '{hooks: {PreToolUse: [{matcher: "Read", hooks: [{type: "command", command: $c}]}]}}')
+  exec "$CLAUDE_BIN" --strict-mcp-config --exclude-dynamic-system-prompt-sections \
+    --disallowedTools=WebSearch,LSP "--settings=$hook_settings" "$@"
+fi
 exec "$CLAUDE_BIN" --strict-mcp-config --exclude-dynamic-system-prompt-sections \
   --disallowedTools=WebSearch,LSP "$@"

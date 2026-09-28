@@ -17,6 +17,65 @@
       "ttl_seconds": 1800,
       "is_default": true,
       "model_type_override": "llm"
+    },
+    "Qwen3.6-35B-A3B-UD-MLX-4bit-vision": {
+      "model_alias": "qwen3.6-35b-a3b-vision",
+      "display_name": "Qwen3.6-35B-A3B (Unsloth UD-MLX-4bit, vision)",
+      "max_context_window": 163840,
+      "max_tokens": 32768,
+      "temperature": 0.6,
+      "top_p": 0.95,
+      "top_k": 20,
+      "min_p": 0.0,
+      "presence_penalty": 0.0,
+      "repetition_penalty": 1.0,
+      "enable_thinking": true,
+      "preserve_thinking": true,
+      "ttl_seconds": 1800,
+      "is_default": false,
+      "model_type_override": "vlm"
+    },
+    "Qwen3.8-27B-oQ4e-mtp": {
+      "model_alias": "qwen3.8-27b",
+      "display_name": "Qwen3.8-27B (oMLX oQ4e-mtp)",
+      "max_context_window": 163840,
+      "max_tokens": 32768,
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "top_k": 20,
+      "min_p": 0.0,
+      "presence_penalty": 0.0,
+      "repetition_penalty": 1.0,
+      "enable_thinking": true,
+      "preserve_thinking": true,
+      "chat_template_kwargs": {
+        "reasoning_effort": "medium"
+      },
+      "mtp_enabled": true,
+      "ttl_seconds": 1800,
+      "is_default": false,
+      "model_type_override": "llm"
+    },
+    "Qwen3.8-27B-oQ4e-mtp-vision": {
+      "model_alias": "qwen3.8-27b-vision",
+      "display_name": "Qwen3.8-27B (oMLX oQ4e-mtp, vision)",
+      "max_context_window": 163840,
+      "max_tokens": 32768,
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "top_k": 20,
+      "min_p": 0.0,
+      "presence_penalty": 0.0,
+      "repetition_penalty": 1.0,
+      "enable_thinking": true,
+      "preserve_thinking": true,
+      "chat_template_kwargs": {
+        "reasoning_effort": "medium"
+      },
+      "mtp_enabled": false,
+      "ttl_seconds": 1800,
+      "is_default": false,
+      "model_type_override": "vlm"
     }
   }
 }

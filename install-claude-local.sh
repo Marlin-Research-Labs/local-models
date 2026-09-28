@@ -3,24 +3,32 @@
 # Automates INSTALL.md. No admin rights needed, and it never uses sudo. It is safe to
 # re-run: finished steps are skipped, and existing configs are merged rather than replaced.
 #
-# Usage: ./install-claude-local.sh [--no-verify] [--memory-test] [--force] [--help]
-#   --no-verify    install only; don't start the server or run the checks
-#   --memory-test  also run the full-context memory test (1-2 minutes, ~27 GB)
-#   --force        continue on a Mac that looks too small for this model
+# Usage: ./install-claude-local.sh [--with-quality] [--no-verify] [--memory-test] [--restart-server] [--force] [--help]
+#   --with-quality  also install the quality model, Qwen3.8-27B (17 GB more)
+#   --no-verify     install only; don't start the server or run the checks
+#   --memory-test   also test every installed model, with and without vision, at
+#                   its full context window (several minutes; restarts the server)
+#   --restart-server  restart the server (to load new models or settings) and run
+#                   the memory test even if another session seems to be using it
+#   --force         continue on a Mac that looks too small for these models
 
 set -euo pipefail
 
 OMLX_TAG="v0.7.0rc1"
-MODEL_REPO="unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit"
-MODEL_DIR_NAME="Qwen3.6-35B-A3B-UD-MLX-4bit"
-MODEL_ALIAS="qwen3.6-35b-a3b"
+FAST_REPO="unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit"
+FAST_REV="6700c3e5bdeb050a379c8d2a4133f43f3647f20f"
+FAST_DIR="Qwen3.6-35B-A3B-UD-MLX-4bit"
+FAST_ALIAS="qwen3.6-35b-a3b"
+QUALITY_REPO="Jundot/Qwen3.8-27B-oQ4e-mtp"
+QUALITY_REV="04dc5509edd8670fc78cc8c2f74bf9b77b1f2acc"
+QUALITY_DIR="Qwen3.8-27B-oQ4e-mtp"
+QUALITY_ALIAS="qwen3.8-27b"
 PORT=8765
 
 APP="$HOME/Applications/oMLX.app"
 OMLX_CLI="$APP/Contents/MacOS/omlx-cli"
 OMLX_PY_ROOT="$APP/Contents/Resources/Python"
 OMLX_HOME="$HOME/.omlx"
-MODEL_DIR="$OMLX_HOME/models/$MODEL_DIR_NAME"
 PROFILE="$HOME/.claude-local"
 WRAPPER="$HOME/.local/bin/claude-local"
 BASELINE="$HOME/claude-local-baseline"
@@ -30,15 +38,21 @@ JQ=/usr/bin/jq
 verify=1
 memory_test=0
 force=0
+restart_server=0
+with_quality=0
 for arg in "$@"; do
   case "$arg" in
+    --with-quality) with_quality=1 ;;
     --no-verify) verify=0 ;;
     --memory-test) memory_test=1 ;;
     --force) force=1 ;;
-    -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --restart-server) restart_server=1 ;;
+    -h|--help) awk 'NR > 1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
     *) echo "unknown option: $arg (see --help)" >&2; exit 2 ;;
   esac
 done
+# A quality model that is already installed is kept up to date on re-runs.
+[ -f "$OMLX_HOME/models/$QUALITY_DIR/config.json" ] && with_quality=1
 
 step() { printf '\n==> %s\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
@@ -54,6 +68,11 @@ omlx_py() {
 
 same_json() {  # same_json <a> <b>: true when both files hold the same JSON
   cmp -s <("$JQ" -S . "$1" 2>/dev/null) <("$JQ" -S . "$2" 2>/dev/null)
+}
+
+# Hashes of the normal Claude Code settings; a missing file is simply left out.
+settings_sha() {
+  shasum -a 256 "$HOME/.claude/settings.json" "$HOME/.claude/CLAUDE.md" 2>/dev/null || true
 }
 
 api() {  # api <path> <json-or-@file>: POST to the local server
@@ -80,8 +99,14 @@ CLAUDE_BIN="$HOME/.local/bin/claude"
 [ -n "$CLAUDE_BIN" ] || die "Claude Code not found. Install it first (https://code.claude.com/docs) and log in."
 info "Claude Code: $CLAUDE_BIN ($("$CLAUDE_BIN" --version 2>/dev/null | head -1))"
 
-have_model_gb=$(du -sg "$MODEL_DIR" 2>/dev/null | cut -f1 || true)
-need_gb=$(( 30 - ${have_model_gb:-0} ))
+have_fast_gb=$( { du -sgL "$OMLX_HOME/models/$FAST_DIR" "$OMLX_HOME/downloads/$FAST_DIR" 2>/dev/null || true; } \
+  | awk '{ s += $1 } END { print s + 0 }')
+need_gb=$(( 30 - have_fast_gb ))
+if [ "$with_quality" -eq 1 ]; then
+  have_quality_gb=$( { du -sgL "$OMLX_HOME/models/$QUALITY_DIR" "$OMLX_HOME/downloads/$QUALITY_DIR" 2>/dev/null || true; } \
+    | awk '{ s += $1 } END { print s + 0 }')
+  need_gb=$(( need_gb + 18 - have_quality_gb ))
+fi
 free_gb=$(df -g "$HOME" | awk 'NR == 2 {print $4}')
 [ "$free_gb" -ge "$need_gb" ] || die "Need about $need_gb GB of free disk space; only $free_gb GB free."
 info "disk: $free_gb GB free"
@@ -104,8 +129,8 @@ if [ -f "$BASELINE/sha.txt" ]; then
   info "baseline of normal Claude Code already in $BASELINE"
 else
   mkdir -p "$BASELINE"
-  shasum -a 256 "$HOME/.claude/settings.json" "$HOME/.claude/CLAUDE.md" 2>/dev/null > "$BASELINE/sha.txt" || true
-  "$CLAUDE_BIN" auth status > "$BASELINE/auth.txt" 2>&1 || true
+  settings_sha > "$BASELINE/sha.txt"
+  "$CLAUDE_BIN" auth status > "$BASELINE/auth.txt" 2>/dev/null || true
   info "recorded a baseline of normal Claude Code in $BASELINE"
 fi
 
@@ -153,34 +178,72 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-step "3/8 Downloading the model $MODEL_REPO (INSTALL.md step 3)"
-mkdir -p "$MODEL_DIR"
-curl -fsSL "https://huggingface.co/api/models/$MODEL_REPO/tree/main?recursive=true" \
-  | "$JQ" -r '.[] | select(.type == "file" and .path != ".gitattributes") | "\(.path) \(.lfs.size // .size)"' \
-  > "$MODEL_DIR/.filelist" || die "Could not list the model files on Hugging Face."
-failed=0
-while read -r f sz; do
-  out="$MODEL_DIR/$f"
-  mkdir -p "$(dirname "$out")"
-  for try in 1 2 3 4 5; do
-    [ "$(stat -f %z "$out" 2>/dev/null || echo 0)" = "$sz" ] && break
-    info "downloading $f ($(( sz / 1000000 )) MB), attempt $try"
-    curl -fL --retry 5 --retry-delay 5 -C - -o "$out" "https://huggingface.co/$MODEL_REPO/resolve/main/$f" || true
-  done
-  if [ "$(stat -f %z "$out" 2>/dev/null || echo 0)" = "$sz" ]; then
-    info "OK   $f"
-  else
-    warn "FAIL $f"
-    failed=1
+step "3/8 Downloading the models (INSTALL.md step 3)"
+
+# download_model <repo> <revision> <folder>: resumable, pinned to a revision,
+# sizes checked against Hugging Face. New downloads go to ~/.omlx/downloads
+# first and move into ~/.omlx/models when complete, so the server never sees
+# a half-finished model.
+download_model() {
+  local repo="$1" rev="$2" name="$3" dest="$OMLX_HOME/models/$3" work f sz out try failed=0
+  if [ -d "$dest" ]; then work="$dest"; else work="$OMLX_HOME/downloads/$name"; fi
+  mkdir -p "$work"
+  info "$repo @ ${rev:0:8} -> $dest"
+  curl -fsSL "https://huggingface.co/api/models/$repo/tree/$rev?recursive=true" \
+    | "$JQ" -r '.[] | select(.type == "file" and .path != ".gitattributes") | "\(.path) \(.lfs.size // .size)"' \
+    > "$work/.filelist" || die "Could not list $repo on Hugging Face."
+  while read -r f sz; do
+    out="$work/$f"
+    mkdir -p "$(dirname "$out")"
+    for try in 1 2 3 4 5; do
+      [ "$(stat -f %z "$out" 2>/dev/null || echo 0)" = "$sz" ] && break
+      info "downloading $f ($(( sz / 1000000 )) MB), attempt $try"
+      curl -fL --retry 5 --retry-delay 5 -C - -o "$out" "https://huggingface.co/$repo/resolve/$rev/$f" || true
+    done
+    if [ "$(stat -f %z "$out" 2>/dev/null || echo 0)" = "$sz" ]; then
+      info "OK   $f"
+    else
+      warn "FAIL $f"
+      failed=1
+    fi
+  done < "$work/.filelist"
+  [ "$failed" -eq 0 ] || die "Some files of $repo did not download. Re-run to resume."
+  if [ "$work" != "$dest" ]; then
+    mkdir -p "$OMLX_HOME/models"
+    mv "$work" "$dest"
+    models_changed=1
   fi
-done < "$MODEL_DIR/.filelist"
-[ "$failed" -eq 0 ] || die "Some model files did not download. Re-run to resume."
+}
+
+models_changed=0
+download_model "$FAST_REPO" "$FAST_REV" "$FAST_DIR"
+if [ "$with_quality" -eq 1 ]; then
+  download_model "$QUALITY_REPO" "$QUALITY_REV" "$QUALITY_DIR"
+else
+  info "quality model (Qwen3.8-27B) not requested; add --with-quality to install it"
+fi
+
+# Vision variants are symlinks to the same weights under another model id,
+# which oMLX serves with its vision engine.
+for name in "$FAST_DIR" "$QUALITY_DIR"; do
+  [ -f "$OMLX_HOME/models/$name/config.json" ] || continue
+  link="$OMLX_HOME/models/$name-vision"
+  if [ "$(readlink "$link" 2>/dev/null || true)" = "$name" ]; then
+    info "vision variant: $name-vision is in place"
+  elif [ -L "$link" ] || [ ! -e "$link" ]; then
+    ln -sfn "$name" "$link"
+    models_changed=1
+    info "vision variant: $name-vision -> $name"
+  else
+    warn "$link exists and is not a symlink; leaving it alone"
+  fi
+done
 
 # ---------------------------------------------------------------------------
 step "4/8 Sizing for this Mac's GPU memory budget (INSTALL.md step 7)"
 budget=$(omlx_py -c "import mlx.core as mx; print(round(mx.device_info()['max_recommended_working_set_size'] / 2**30, 1))") \
   || die "Could not read the GPU memory budget with oMLX's bundled Python."
-info "GPU budget: $budget GiB (the model's weights take 19.7 GB)"
+info "GPU budget: $budget GiB (loaded, the fast model takes 19.7 GB and the quality model 15.2 GB)"
 if awk -v b="$budget" 'BEGIN { exit !(b >= 34) }'; then
   tier="balanced"
 elif awk -v b="$budget" 'BEGIN { exit !(b >= 27) }'; then
@@ -190,7 +253,7 @@ else
   tier="aggressive"
   warn "budget below 27 GiB; long prompts will be rejected. Consider CLAUDE_LOCAL_CTX=65536 CLAUDE_LOCAL_MAX_OUT=16384."
 fi
-info "memory guard tier: $tier, Claude Code context window: 131072"
+info "memory guard tier: $tier (context windows per model: claude-local --local-status)"
 
 # ---------------------------------------------------------------------------
 step "5/8 Configuring oMLX (INSTALL.md step 4)"
@@ -204,7 +267,7 @@ if [ -f "$settings" ] && [ ! -e "$settings.pre-claude-local" ] \
   info "saved your previous settings.json as settings.json.pre-claude-local"
 fi
 if [ -f "$models" ] && [ ! -e "$models.pre-claude-local" ] \
-   && ! "$JQ" -e --arg k "$MODEL_DIR_NAME" --arg a "$MODEL_ALIAS" '.models[$k].model_alias == $a' "$models" >/dev/null 2>&1; then
+   && ! "$JQ" -e --arg k "$FAST_DIR" --arg a "$FAST_ALIAS" '.models[$k].model_alias == $a' "$models" >/dev/null 2>&1; then
   cp "$models" "$models.pre-claude-local"
   info "saved your previous model_settings.json as model_settings.json.pre-claude-local"
 fi
@@ -230,29 +293,97 @@ else
   info "updated $settings"
 fi
 
-model_entry=$(cat <<'MODEL_ENTRY'
+# Settings for every model and vision variant; entries for models that aren't
+# installed are harmless. Values already in an entry win, so your own edits
+# (such as reasoning_effort) survive re-runs; only model_alias and
+# model_type_override are always reset, because claude-local depends on them.
+model_entries=$(cat <<'MODEL_ENTRIES'
 {
-  "model_alias": "qwen3.6-35b-a3b",
-  "display_name": "Qwen3.6-35B-A3B (Unsloth UD-MLX-4bit)",
-  "max_context_window": 163840,
-  "max_tokens": 32768,
-  "temperature": 0.6,
-  "top_p": 0.95,
-  "top_k": 20,
-  "min_p": 0.0,
-  "presence_penalty": 0.0,
-  "repetition_penalty": 1.0,
-  "enable_thinking": true,
-  "preserve_thinking": true,
-  "ttl_seconds": 1800,
-  "is_default": true,
-  "model_type_override": "llm"
+  "Qwen3.6-35B-A3B-UD-MLX-4bit": {
+    "model_alias": "qwen3.6-35b-a3b",
+    "display_name": "Qwen3.6-35B-A3B (Unsloth UD-MLX-4bit)",
+    "max_context_window": 163840,
+    "max_tokens": 32768,
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+    "repetition_penalty": 1.0,
+    "enable_thinking": true,
+    "preserve_thinking": true,
+    "ttl_seconds": 1800,
+    "is_default": true,
+    "model_type_override": "llm"
+  },
+  "Qwen3.6-35B-A3B-UD-MLX-4bit-vision": {
+    "model_alias": "qwen3.6-35b-a3b-vision",
+    "display_name": "Qwen3.6-35B-A3B (Unsloth UD-MLX-4bit, vision)",
+    "max_context_window": 163840,
+    "max_tokens": 32768,
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+    "repetition_penalty": 1.0,
+    "enable_thinking": true,
+    "preserve_thinking": true,
+    "ttl_seconds": 1800,
+    "is_default": false,
+    "model_type_override": "vlm"
+  },
+  "Qwen3.8-27B-oQ4e-mtp": {
+    "model_alias": "qwen3.8-27b",
+    "display_name": "Qwen3.8-27B (oMLX oQ4e-mtp)",
+    "max_context_window": 163840,
+    "max_tokens": 32768,
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+    "repetition_penalty": 1.0,
+    "enable_thinking": true,
+    "preserve_thinking": true,
+    "chat_template_kwargs": {
+      "reasoning_effort": "medium"
+    },
+    "mtp_enabled": true,
+    "ttl_seconds": 1800,
+    "is_default": false,
+    "model_type_override": "llm"
+  },
+  "Qwen3.8-27B-oQ4e-mtp-vision": {
+    "model_alias": "qwen3.8-27b-vision",
+    "display_name": "Qwen3.8-27B (oMLX oQ4e-mtp, vision)",
+    "max_context_window": 163840,
+    "max_tokens": 32768,
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+    "repetition_penalty": 1.0,
+    "enable_thinking": true,
+    "preserve_thinking": true,
+    "chat_template_kwargs": {
+      "reasoning_effort": "medium"
+    },
+    "mtp_enabled": false,
+    "ttl_seconds": 1800,
+    "is_default": false,
+    "model_type_override": "vlm"
+  }
 }
-MODEL_ENTRY
+MODEL_ENTRIES
 )
 tmp=$(mktemp)
-"$JQ" --arg k "$MODEL_DIR_NAME" --argjson e "$model_entry" \
-  '.version //= 1 | .models[$k] = ((.models[$k] // {}) + $e)' "$models" > "$tmp"
+"$JQ" --argjson e "$model_entries" '
+    .version //= 1
+  | .models = (reduce ($e | to_entries[]) as $x ((.models // {});
+      .[$x.key] = (($x.value * (.[$x.key] // {})) + ($x.value | {model_alias, model_type_override}))))
+  ' "$models" > "$tmp"
 if same_json "$tmp" "$models"; then
   info "model_settings.json is up to date"
   rm -f "$tmp"
@@ -287,8 +418,11 @@ cat > "$new" <<'CLAUDE_LOCAL_SCRIPT'
 #!/bin/bash
 # claude-local: run Claude Code against a local open-weight model.
 #
-# Default backend: oMLX (~/Applications/oMLX.app) serving Qwen3.6-35B-A3B
-# (Unsloth UD-MLX-4bit) on http://127.0.0.1:8765. Fallback backend: Ollama.
+# Models, served by oMLX (~/Applications/oMLX.app) on http://127.0.0.1:8765:
+#   fast     Qwen3.6-35B-A3B (Unsloth UD-MLX-4bit), the default
+#   quality  Qwen3.8-27B (oMLX oQ4e-mtp), slower but stronger; install it with
+#            install-claude-local.sh --with-quality
+# Either model can run with image input (vision) on or off (the default).
 #
 # Everything here is scoped to this process. It never edits ~/.claude,
 # ~/.claude.json, shell rc files or launchd, so the normal `claude` command
@@ -298,18 +432,22 @@ cat > "$new" <<'CLAUDE_LOCAL_SCRIPT'
 # Org-managed settings (MintMCP hooks, OTEL telemetry) still apply here by
 # design; nothing in this script bypasses them.
 #
-# Wrapper-only commands (first argument):
-#   --local-status   show server, model and memory warnings
-#   --local-start    start the server and load the model, then exit
-#   --local-stop     stop the oMLX server started by claude-local
-#   --local-help     show this help
+# Wrapper options (they must come before any Claude Code arguments):
+#   --local-fast | --local-quality       choose the model (default: fast)
+#   --local-vision | --local-no-vision   image input on or off (default: off)
+#   --local-set-default   save the model and vision options given, then exit
+#   --local-status        show the selection, the server and installed models
+#   --local-start         start the server and load the selected model, then exit
+#   --local-stop          stop the oMLX server started by claude-local
+#   --local-help          show this help
 #
-# Overrides (environment, per invocation):
-#   CLAUDE_LOCAL_BACKEND  omlx (default) | ollama
-#   CLAUDE_LOCAL_MODEL    model id served by the backend
-#   CLAUDE_LOCAL_PORT     backend port (oMLX 8765, Ollama 11434)
-#   CLAUDE_LOCAL_CTX      context window Claude Code plans for (default 131072)
-#   CLAUDE_LOCAL_MAX_OUT  max output tokens per response (default 32000)
+# Environment, per invocation: CLAUDE_LOCAL_PROFILE=fast|quality and
+# CLAUDE_LOCAL_VISION=on|off. For experiments: CLAUDE_LOCAL_MODEL (served model
+# id), CLAUDE_LOCAL_CTX, CLAUDE_LOCAL_MAX_OUT, CLAUDE_LOCAL_PORT and
+# CLAUDE_LOCAL_BACKEND=omlx|ollama.
+#
+# Precedence: option > environment > saved default > built-in. Saved defaults
+# live in ~/.config/claude-local/defaults (or $XDG_CONFIG_HOME/claude-local).
 
 set -euo pipefail
 
@@ -327,30 +465,149 @@ OMLX_APP="$HOME/Applications/oMLX.app"
 OMLX_CLI="$OMLX_APP/Contents/MacOS/omlx-cli"
 OMLX_HOME="$HOME/.omlx"
 OMLX_LOG="$OMLX_HOME/logs/claude-local-server.log"
-OMLX_PIDFILE="$OMLX_HOME/claude-local-server.pid"
 LOCAL_CONFIG_DIR="$HOME/.claude-local"
+DEFAULTS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-local/defaults"
 
+# --- Wrapper options: a leading run of --local-* arguments ------------------
+opt_profile=""
+opt_vision=""
+cmd=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --local-fast) opt_profile=fast ;;
+    --local-quality) opt_profile=quality ;;
+    --local-vision) opt_vision=on ;;
+    --local-no-vision) opt_vision=off ;;
+    --local-status|--local-start|--local-stop|--local-help|--local-set-default)
+      [ -z "$cmd" ] || die "one of --local-status/start/stop/help/set-default at a time"
+      cmd="${1#--local-}" ;;
+    --local-*) echo "claude-local: unknown option '$1' (see claude-local --local-help)" >&2; exit 2 ;;
+    *) break ;;
+  esac
+  shift
+done
+
+if [ "$cmd" = "help" ]; then
+  awk 'NR > 1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0"
+  exit 0
+fi
+
+# --- Resolve model and vision ------------------------------------------------
+saved_profile=""
+saved_vision=""
+if [ -r "$DEFAULTS_FILE" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%%#*}              # drop comments
+    line=${line//[[:space:]]/}    # drop all whitespace, including CR
+    case "$line" in
+      "") ;;
+      profile=fast|profile=quality) saved_profile=${line#*=} ;;
+      vision=on|vision=off) saved_vision=${line#*=} ;;
+      *) warn "ignoring '$line' in $DEFAULTS_FILE (expected profile=fast|quality or vision=on|off)" ;;
+    esac
+  done < "$DEFAULTS_FILE"
+fi
+
+env_profile="${CLAUDE_LOCAL_PROFILE:-}"
+case "$env_profile" in ""|fast|quality) ;; *) die "CLAUDE_LOCAL_PROFILE must be fast or quality" ;; esac
+case "${CLAUDE_LOCAL_VISION:-}" in
+  "") env_vision="" ;;
+  on|1|yes|true) env_vision=on ;;
+  off|0|no|false) env_vision=off ;;
+  *) die "CLAUDE_LOCAL_VISION must be on or off" ;;
+esac
+
+# Remember where each choice came from, for --local-status.
+if [ -n "$opt_profile" ]; then profile=$opt_profile; profile_src="option"
+elif [ -n "$env_profile" ]; then profile=$env_profile; profile_src="CLAUDE_LOCAL_PROFILE"
+elif [ -n "$saved_profile" ]; then profile=$saved_profile; profile_src="saved default"
+else profile=fast; profile_src="built-in"; fi
+if [ -n "$opt_vision" ]; then vision=$opt_vision; vision_src="option"
+elif [ -n "$env_vision" ]; then vision=$env_vision; vision_src="CLAUDE_LOCAL_VISION"
+elif [ -n "$saved_vision" ]; then vision=$saved_vision; vision_src="saved default"
+else vision=off; vision_src="built-in"; fi
+
+# One row per model and vision setting: model folder, served alias, the
+# context window Claude Code plans for (measured with
+# install-claude-local.sh --memory-test), max output tokens, and extra
+# Claude Code settings. Vision rows are symlinks to the same weights,
+# served by oMLX's vision engine.
+profile_row() {  # profile_row <profile> <vision>
+  caps=""
+  case "$1:$2" in
+    fast:off)    dir=Qwen3.6-35B-A3B-UD-MLX-4bit;        alias=qwen3.6-35b-a3b;        row_ctx=131072; row_out=32000 ;;
+    fast:on)     dir=Qwen3.6-35B-A3B-UD-MLX-4bit-vision; alias=qwen3.6-35b-a3b-vision; row_ctx=106496; row_out=32000 ;;
+    quality:off) dir=Qwen3.8-27B-oQ4e-mtp;               alias=qwen3.8-27b;            row_ctx=94208;  row_out=20000
+                 caps="-mid_conv_system" ;;
+    quality:on)  dir=Qwen3.8-27B-oQ4e-mtp-vision;        alias=qwen3.8-27b-vision;     row_ctx=81920;  row_out=20000
+                 caps="-mid_conv_system" ;;
+  esac
+}
+installed() { [ -f "$OMLX_HOME/models/$1/config.json" ]; }
+
+# Why the model for the current row isn't usable, as a hint for the user.
+missing_hint() {
+  case "$dir" in
+    *-vision) if installed "${dir%-vision}"; then
+                echo "its vision variant (~/.omlx/models/$dir) is missing; re-run install-claude-local.sh to create it"
+                return
+              fi ;;
+  esac
+  case "$profile" in
+    quality) echo "the quality model is not installed; run install-claude-local.sh --with-quality" ;;
+    *) echo "the fast model is not installed; run install-claude-local.sh" ;;
+  esac
+}
+
+if [ "$cmd" = "set-default" ]; then
+  [ -n "$opt_profile$opt_vision" ] || die "give --local-fast/--local-quality and/or --local-vision/--local-no-vision to save"
+  # Save only what the options say; keep the other saved value. Environment
+  # variables are never saved.
+  new_profile="${opt_profile:-${saved_profile:-fast}}"
+  new_vision="${opt_vision:-${saved_vision:-off}}"
+  profile_row "$new_profile" "$new_vision"
+  installed "$dir" || { profile=$new_profile; die "can't save that default: $(missing_hint)"; }
+  mkdir -p "$(dirname "$DEFAULTS_FILE")"
+  tmp=$(mktemp "$DEFAULTS_FILE.XXXXXX")
+  {
+    echo "# claude-local saved defaults (claude-local --local-set-default); edit or delete freely"
+    echo "profile=$new_profile"
+    echo "vision=$new_vision"
+  } > "$tmp"
+  mv "$tmp" "$DEFAULTS_FILE"
+  echo "claude-local: saved default: $new_profile, vision $new_vision ($DEFAULTS_FILE)"
+  exit 0
+fi
+
+profile_row "$profile" "$vision"
 backend="${CLAUDE_LOCAL_BACKEND:-omlx}"
 case "$backend" in
   omlx)
     port="${CLAUDE_LOCAL_PORT:-8765}"
-    model="${CLAUDE_LOCAL_MODEL:-qwen3.6-35b-a3b}"
     token="local"
     ;;
   ollama)
+    [ "$profile:$vision" = "fast:off" ] || [ -n "${CLAUDE_LOCAL_MODEL:-}" ] \
+      || die "the Ollama backend only has the fast model without vision; set CLAUDE_LOCAL_MODEL"
     port="${CLAUDE_LOCAL_PORT:-11434}"
-    model="${CLAUDE_LOCAL_MODEL:-qwen3.6:35b-a3b-coding-nvfp4}"
+    alias="qwen3.6:35b-a3b-coding-nvfp4"
     token="ollama"
+    caps=""
     ;;
   *)
     echo "claude-local: unknown CLAUDE_LOCAL_BACKEND '$backend' (use omlx or ollama)" >&2
     exit 2
     ;;
 esac
+model="${CLAUDE_LOCAL_MODEL:-$alias}"
+ctx="${CLAUDE_LOCAL_CTX:-$row_ctx}"
+max_out="${CLAUDE_LOCAL_MAX_OUT:-$row_out}"
 base_url="http://127.0.0.1:$port"
-ctx="${CLAUDE_LOCAL_CTX:-131072}"
-max_out="${CLAUDE_LOCAL_MAX_OUT:-32000}"
+# One pid file per port, so a test server on another port can't clobber it.
+if [ "$port" = "8765" ]; then OMLX_PIDFILE="$OMLX_HOME/claude-local-server.pid"
+else OMLX_PIDFILE="$OMLX_HOME/claude-local-server-$port.pid"; fi
 
+# --- Server helpers ----------------------------------------------------------
 # True when the backend answers and lists $model.
 server_has_model() {
   curl -fsS -m 3 -H "Authorization: Bearer $token" "$base_url/v1/models" 2>/dev/null \
@@ -359,6 +616,18 @@ server_has_model() {
 
 port_listener_pid() {
   lsof -nP -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null | head -1 || true
+}
+
+is_omlx_pid() {
+  case "$(ps -o command= -p "$1" 2>/dev/null)" in *omlx*) return 0 ;; *) return 1 ;; esac
+}
+
+# Prints "<alias> <seconds since last use>" for each model oMLX has loaded.
+loaded_models() {
+  curl -fsS -m 3 -H "Authorization: Bearer $token" "$base_url/v1/models/status" 2>/dev/null \
+    | /usr/bin/jq -r --argjson now "$(date +%s)" \
+        '.models[]? | select(.loaded) | "\(.model_alias // .id) \(if .last_access then ($now - .last_access | floor) else -1 end)"' \
+        2>/dev/null || true
 }
 
 # Two ~20 GB models cannot share 36 GB, and OrbStack's VM holds ~13 GB.
@@ -377,6 +646,41 @@ memory_warnings() {
     [ "${m:-0}" -gt 0 ] && warn "LM Studio has $m model(s) loaded; unload them with 'lms unload --all'."
   fi
   return 0
+}
+
+# Requests the server is working on or has queued ("?" if it can't say).
+requests_in_flight() {
+  curl -fsS -m 3 -H "Authorization: Bearer $token" "$base_url/api/status" 2>/dev/null \
+    | /usr/bin/jq -r '(.active_requests // 0) + (.waiting_requests // 0)' 2>/dev/null || echo "?"
+}
+
+# oMLX holds one model at a time here; switching models evicts the other.
+# last_access is set when a request starts, so a long generation can look
+# idle; the in-flight count covers that.
+swap_warning() {
+  [ "$backend" = "omlx" ] || return 0
+  local other idle busy
+  busy=$(requests_in_flight)
+  while read -r other idle; do
+    [ -n "$other" ] && [ "$other" != "$model" ] || continue
+    if [ "$busy" != "0" ] && [ "$busy" != "?" ]; then
+      warn "$other is serving a request right now, probably for another session; this launch will wait for it, then swap it out for $model."
+    elif [ "$idle" -ge 0 ] && [ "$idle" -lt 600 ]; then
+      warn "$other was used ${idle}s ago, probably by another session; this launch swaps it out for $model."
+    fi
+  done <<EOF
+$(loaded_models)
+EOF
+  return 0
+}
+
+# Claude Code subcommands (mcp, doctor, update, ...) take no session flags
+# and need no model.
+is_subcommand() {
+  case "${1:-}" in
+    agents|attach|auth|auto-mode|doctor|gateway|import|install|logs|mcp|plugin|plugins|project|respawn|rm|setup-token|stop|kill|ultrareview|update|upgrade) return 0 ;;
+  esac
+  return 1
 }
 
 start_omlx() {
@@ -413,10 +717,7 @@ stop_omlx() {
     rm -f "$OMLX_PIDFILE"
     return 0
   fi
-  case "$(ps -o command= -p "$pid" 2>/dev/null)" in
-    *omlx*) ;;
-    *) die "pid $pid on port $port is not oMLX; not stopping it" ;;
-  esac
+  is_omlx_pid "$pid" || die "pid $pid on port $port is not oMLX; not stopping it"
   kill -TERM "$pid" 2>/dev/null || true
   local i=0
   while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 20 ]; do sleep 1; i=$((i + 1)); done
@@ -427,7 +728,7 @@ stop_omlx() {
 }
 
 # Ask the server to load the model now, so the first Claude Code turn
-# doesn't also pay the ~20 GB load time.
+# doesn't also pay the load time.
 warm_model() {
   curl -fsS -m 600 -H "Authorization: Bearer $token" -H "content-type: application/json" \
     -H "anthropic-version: 2023-06-01" "$base_url/v1/messages" \
@@ -435,43 +736,83 @@ warm_model() {
     >/dev/null
 }
 
-case "${1:-}" in
-  --local-help)
-    sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'
-    exit 0
-    ;;
-  --local-status)
-    echo "backend: $backend  url: $base_url  model: $model  context: $ctx  max output: $max_out"
-    echo "claude: $CLAUDE_BIN  omlx: $OMLX_CLI"
-    if server_has_model; then echo "server: up, '$model' available"; else echo "server: down or '$model' not listed"; fi
+# Make sure the requested model exists, and the server is up and lists it.
+ensure_server() {
+  if [ "$backend" = "omlx" ] && [ -z "${CLAUDE_LOCAL_MODEL:-}" ] && ! installed "$dir"; then
+    die "$(missing_hint)"
+  fi
+  server_has_model && return 0
+  [ "$backend" = "omlx" ] || die "Ollama is not serving '$model' at $base_url (is the Ollama app running?)"
+  local pid
+  pid=$(port_listener_pid)
+  if [ -n "$pid" ]; then
+    is_omlx_pid "$pid" \
+      && die "oMLX is running but doesn't list '$model'. Run 'claude-local --local-stop' so the next launch rescans its models."
+    die "port $port is in use by pid $pid, which isn't oMLX. Check it with: lsof -nP -iTCP:$port"
+  fi
+  start_omlx
+}
+
+show_status() {
+  local mark reserve
+  # Claude Code compacts at W - min(max output, 20000) - 13000 and refuses
+  # to send past W - min(max output, 20000) - 3000.
+  reserve=$(( max_out < 20000 ? max_out : 20000 ))
+  echo "model:      $profile ($profile_src) -> $model"
+  echo "vision:     $vision ($vision_src)"
+  echo "context:    $ctx (auto-compact ~$((ctx - reserve - 13000)), hard limit ~$((ctx - reserve - 3000))); max output $max_out"
+  if [ "$vision" = "off" ]; then
+    echo "images:     off; reading image files is refused, and pasted images aren't seen by the model"
+  fi
+  echo "backend:    $backend $base_url"
+  if server_has_model; then
+    local loaded
+    loaded=$(loaded_models | awk '{ printf "%s%s (idle %ss)", sep, $1, $2; sep = ", " }')
+    echo "server:     up; loaded: ${loaded:-none}"
+  else
+    echo "server:     down, or '$model' not listed"
+  fi
+  echo "defaults:   $DEFAULTS_FILE$([ -r "$DEFAULTS_FILE" ] || echo ' (none saved)')"
+  echo "claude:     $CLAUDE_BIN"
+  echo "omlx:       $OMLX_CLI"
+  echo "installed:"
+  for p in fast quality; do
+    for v in off on; do
+      profile_row "$p" "$v"
+      if installed "$dir"; then mark="installed    ctx $row_ctx"; else mark="not installed"; fi
+      printf '            %-8s vision %-4s %s\n' "$p" "$v" "$mark"
+    done
+  done
+  profile_row "$profile" "$vision"
+}
+
+case "$cmd" in
+  status)
+    show_status
     memory_warnings
     exit 0
     ;;
-  --local-stop)
+  stop)
     [ "$backend" = "omlx" ] || die "--local-stop only manages oMLX; quit Ollama from its menu-bar app"
     stop_omlx
     exit 0
     ;;
-  --local-start)
+  start)
     memory_warnings
-    if ! server_has_model; then
-      [ "$backend" = "omlx" ] || die "Ollama is not serving '$model' at $base_url"
-      start_omlx
-    fi
+    ensure_server
+    swap_warning
     echo "claude-local: loading '$model'..." >&2
     warm_model || die "the model failed to load; see $OMLX_LOG"
-    echo "claude-local: ready at $base_url"
+    echo "claude-local: ready at $base_url ($profile, vision $vision)"
     exit 0
     ;;
 esac
 
-memory_warnings
-if ! server_has_model; then
-  if [ "$backend" = "omlx" ]; then
-    start_omlx
-  else
-    die "Ollama is not serving '$model' at $base_url (is the Ollama app running?)"
-  fi
+if ! is_subcommand "${1:-}"; then
+  memory_warnings
+  ensure_server
+  swap_warning
+  [ -t 2 ] && echo "claude-local: $profile, vision $vision -> $model, context $ctx" >&2
 fi
 
 [ -d "$LOCAL_CONFIG_DIR" ] || mkdir -p "$LOCAL_CONFIG_DIR"
@@ -482,7 +823,7 @@ unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_PROFILE ANTHROPIC_BETA
   CLAUDE_CODE_USE_FOUNDRY CLAUDE_CODE_USE_MANTLE CLAUDE_CODE_USE_GATEWAY \
   CLAUDE_CODE_USE_ANTHROPIC_AWS CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD \
   CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT \
-  CLAUDE_CODE_AUTO_COMPACT_WINDOW CLAUDE_SECURESTORAGE_CONFIG_DIR
+  CLAUDE_CODE_AUTO_COMPACT_WINDOW CLAUDE_SECURESTORAGE_CONFIG_DIR CLAUDE_CODE_MODEL_CAPABILITIES
 
 # Isolated profile and local endpoint.
 export CLAUDE_CONFIG_DIR="$LOCAL_CONFIG_DIR"
@@ -500,6 +841,10 @@ export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$ctx" CLAUDE_CODE_MAX_OUTPUT_TOKENS="$max
 # Keep the prompt prefix stable so the server's prefix cache hits.
 export CLAUDE_CODE_ATTRIBUTION_HEADER=0 CLAUDE_CODE_TOTAL_TOKENS_REMINDER=off
 
+# Qwen3.8's chat template rejects system messages after the first one, and
+# oMLX then moves them to the front, which breaks the prefix cache.
+[ -z "$caps" ] || export CLAUDE_CODE_MODEL_CAPABILITIES="$caps"
+
 # Compatibility with a non-Anthropic backend.
 export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1 ENABLE_CLAUDEAI_MCP_SERVERS=false
 export CLAUDE_CODE_DISABLE_FAST_MODE=1 CLAUDE_CODE_AUTO_MODE_SERVER=0
@@ -514,14 +859,24 @@ export CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLAC
 export API_TIMEOUT_MS=3000000 CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS=1800000
 export CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS=600000
 
-# Claude Code subcommands (mcp, doctor, update, ...) take no session flags.
-case "${1:-}" in
-  agents|attach|auth|auto-mode|doctor|gateway|import|install|logs|mcp|plugin|plugins|project|respawn|rm|setup-token|stop|kill|ultrareview|update|upgrade)
-    exec "$CLAUDE_BIN" "$@"
-    ;;
-esac
+is_subcommand "${1:-}" && exec "$CLAUDE_BIN" "$@"
 
-# WebSearch is an Anthropic server-side tool; LSP schema changes break the prefix cache.
+# WebSearch is an Anthropic server-side tool; LSP schema changes break the
+# prefix cache.
+if [ "$vision" = "off" ]; then
+  # Without vision the server drops images silently. A hook on the Read tool
+  # refuses image files with a clear message instead. (Deny rules would also
+  # hide image files from Glob and Grep.)
+  image_hook=$(cat <<'HOOK'
+/usr/bin/jq -r '.tool_input.file_path // empty' | /usr/bin/grep -qiE '[.](png|jpe?g|gif|webp)$' || exit 0
+printf '%s\n' '{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": "Image input is off in this claude-local session, so image files cannot be viewed. There is no workaround: do not try to decode, OCR or convert images with shell commands or scripts. Tell the user to relaunch with claude-local --local-vision."}}'
+HOOK
+)
+  hook_settings=$(/usr/bin/jq -cn --arg c "$image_hook" \
+    '{hooks: {PreToolUse: [{matcher: "Read", hooks: [{type: "command", command: $c}]}]}}')
+  exec "$CLAUDE_BIN" --strict-mcp-config --exclude-dynamic-system-prompt-sections \
+    --disallowedTools=WebSearch,LSP "--settings=$hook_settings" "$@"
+fi
 exec "$CLAUDE_BIN" --strict-mcp-config --exclude-dynamic-system-prompt-sections \
   --disallowedTools=WebSearch,LSP "$@"
 CLAUDE_LOCAL_SCRIPT
@@ -543,6 +898,10 @@ chmod 755 "$WRAPPER"
 # ---------------------------------------------------------------------------
 if [ "$verify" -eq 0 ]; then
   step "8/8 Skipping checks (--no-verify)"
+  if { [ "$config_changed" -eq 1 ] || [ "$models_changed" -eq 1 ]; } \
+     && [ -n "$(lsof -nP -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)" ]; then
+    warn "oMLX is running with older settings or models; run 'claude-local --local-stop' when no session is using it"
+  fi
   info "Start with: claude-local --local-start, then claude-local"
   exit 0
 fi
@@ -555,33 +914,107 @@ fail() { warn "FAIL $*"; problems=$((problems + 1)); }
 if command -v orbctl >/dev/null 2>&1 && [ "$(orbctl status 2>/dev/null)" = "Running" ]; then
   warn "OrbStack is running and can hold ~13 GB; 'orbctl stop' before long sessions"
 fi
-if [ "$config_changed" -eq 1 ] && [ -n "${pid:-}" ]; then
-  warn "oMLX was already running with older settings. Run 'claude-local --local-stop' when no session is using it, then re-run this script."
+# Is the server in use? Checked before this script sends any requests of its
+# own. A request in flight, one in the last 10 minutes, or a status that can't
+# be read all count as in use.
+server_in_use=0
+if [ -n "$(lsof -nP -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)" ]; then
+  in_flight=$(curl -fsS -m 3 -H "Authorization: Bearer local" "http://127.0.0.1:$PORT/api/status" 2>/dev/null \
+    | "$JQ" -r '(.active_requests // 0) + (.waiting_requests // 0)' 2>/dev/null || echo unknown)
+  recent=$(curl -fsS -m 3 -H "Authorization: Bearer local" "http://127.0.0.1:$PORT/v1/models/status" 2>/dev/null \
+    | "$JQ" -r --argjson now "$(date +%s)" '[.models[]? | select(.last_access != null and ($now - .last_access) < 600)] | length' 2>/dev/null || echo unknown)
+  if [ "$in_flight" != "0" ] || [ "$recent" != "0" ]; then server_in_use=1; fi
+fi
+# A server started before this install doesn't know new models or settings.
+if { [ "$config_changed" -eq 1 ] || [ "$models_changed" -eq 1 ]; } \
+   && [ -n "$(lsof -nP -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)" ]; then
+  if [ "$server_in_use" -eq 0 ] || [ "$restart_server" -eq 1 ]; then
+    info "restarting oMLX so it loads the new settings and models"
+    "$WRAPPER" --local-stop >/dev/null 2>&1 || true
+  else
+    warn "oMLX is running with older settings or models and looks busy (a request in flight or in the last 10 minutes, perhaps from an earlier run of this script), so it wasn't restarted. Checks of new models may fail; re-run with --restart-server when it's free."
+  fi
 fi
 
-info "starting the server and loading the model (about 10-15 s the first time)"
-if "$WRAPPER" --local-start >/dev/null; then pass "server up at http://127.0.0.1:$PORT with $MODEL_ALIAS"; else fail "server did not start; see ~/.omlx/logs/claude-local-server.log"; fi
+info "starting the server and loading the fast model (about 10-15 s the first time)"
+if "$WRAPPER" --local-fast --local-no-vision --local-start >/dev/null; then pass "server up at http://127.0.0.1:$PORT with $FAST_ALIAS"; else fail "server did not start; see ~/.omlx/logs/claude-local-server.log"; fi
 
-answer=$(api /v1/messages '{"model":"'"$MODEL_ALIAS"'","max_tokens":2000,"thinking":{"type":"adaptive"},"messages":[{"role":"user","content":"What is 17*23? Answer with just the number."}]}' \
+answer=$(api /v1/messages '{"model":"'"$FAST_ALIAS"'","max_tokens":2000,"thinking":{"type":"adaptive"},"messages":[{"role":"user","content":"What is 17*23? Answer with just the number."}]}' \
   | "$JQ" -r '[.content[]? | select(.type == "text") | .text] | join("")' 2>/dev/null || true)
 case "$answer" in *391*) pass "API answers correctly (17*23 = 391)" ;; *) fail "API check: expected 391, got '$answer'" ;; esac
 
-call=$(api /v1/messages '{"model":"'"$MODEL_ALIAS"'","max_tokens":4000,"thinking":{"type":"adaptive"},"tools":[{"name":"Bash","description":"Run a shell command.","input_schema":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}],"messages":[{"role":"user","content":"List the files in /tmp using the Bash tool."}]}' \
+call=$(api /v1/messages '{"model":"'"$FAST_ALIAS"'","max_tokens":4000,"thinking":{"type":"adaptive"},"tools":[{"name":"Bash","description":"Run a shell command.","input_schema":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}],"messages":[{"role":"user","content":"List the files in /tmp using the Bash tool."}]}' \
   | "$JQ" -r '"\(.stop_reason) \([.content[]? | select(.type == "tool_use") | .name] | join(","))"' 2>/dev/null || true)
 case "$call" in "tool_use Bash"*) pass "tool calling works" ;; *) fail "tool-call check: got '$call'" ;; esac
 
 testdir=$(mktemp -d)
 reply=$(cd "$testdir" && "$WRAPPER" -p "Reply with exactly the word OK and nothing else." 2>&1 || true)
 case "$reply" in *OK*) pass "claude-local -p works" ;; *) fail "claude-local -p: $(printf '%s' "$reply" | tail -3)" ;; esac
+
+# Vision: a generated image with a number the model has to read.
+omlx_py - "$testdir/check.png" <<'PY'
+import sys
+from PIL import Image, ImageDraw, ImageFont
+img = Image.new("RGB", (640, 400), "white")
+try:
+    font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial Bold.ttf", 72)
+except OSError:
+    font = ImageFont.load_default()
+ImageDraw.Draw(img).text((200, 150), "4821", fill="black", font=font)
+img.save(sys.argv[1])
+PY
+seen=$(printf '{"model":"%s-vision","max_tokens":2000,"thinking":{"type":"adaptive"},"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"%s"}},{"type":"text","text":"What number is written in this image? Reply with just the number."}]}]}' \
+    "$FAST_ALIAS" "$(base64 -i "$testdir/check.png" | tr -d '\n')" > "$testdir/vision.json" \
+  && api /v1/messages "@$testdir/vision.json" | "$JQ" -r '[.content[]? | select(.type == "text") | .text] | join("")' 2>/dev/null || true)
+case "$seen" in *4821*) pass "vision works (fast model read 4821 from an image)" ;; *) fail "vision check: expected 4821, got '$seen'" ;; esac
+
+if [ -f "$OMLX_HOME/models/$QUALITY_DIR/config.json" ]; then
+  curl -fsS -m 5 -H "Authorization: Bearer local" "http://127.0.0.1:$PORT/v1/models" 2>/dev/null \
+    | "$JQ" -e --arg a "$QUALITY_ALIAS" 'any(.data[]?; .id == $a)' >/dev/null 2>&1 \
+    || fail "oMLX doesn't list $QUALITY_ALIAS yet; re-run with --restart-server so it rescans its models"
+  info "loading the quality model (swaps out the fast model)"
+  answer=$(api /v1/messages '{"model":"'"$QUALITY_ALIAS"'","max_tokens":4000,"thinking":{"type":"adaptive"},"messages":[{"role":"user","content":"What is 17*23? Answer with just the number."}]}' \
+    | "$JQ" -r '[.content[]? | select(.type == "text") | .text] | join("")' 2>/dev/null || true)
+  case "$answer" in *391*) pass "quality model answers correctly (17*23 = 391)" ;; *) fail "quality check: expected 391, got '$answer'" ;; esac
+fi
 rm -rf "$testdir"
 
+# Memory test: one prompt at Claude Code's largest size for each installed
+# combination's window (window - 23000 tokens), vision combinations with an
+# image, on a freshly started server so the peak is this prompt's alone.
 if [ "$memory_test" -eq 1 ]; then
-  info "memory test: one prompt at Claude Code's largest size for a 131072 window (~108K tokens)"
-  long=$(mktemp)
-  expected=$(omlx_py - 131072 "$long" <<'PY'
-import glob, json, os, sys, sysconfig
-target = int((int(sys.argv[1]) - 23000) * 3.8)
-text = ""
+  if [ "$server_in_use" -eq 1 ] && [ "$restart_server" -eq 0 ]; then
+    warn "skipping the memory test: the server looked busy before this run (a request in flight or in the last 10 minutes, perhaps from an earlier run of this script); use --restart-server to run it anyway"
+  else
+    memdir=$(mktemp -d)
+    omlx_py - "$memdir/check.png" <<'PY'
+import sys
+from PIL import Image, ImageDraw, ImageFont
+img = Image.new("RGB", (640, 400), "white")
+try:
+    font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial Bold.ttf", 72)
+except OSError:
+    font = ImageFont.load_default()
+ImageDraw.Draw(img).text((200, 150), "4821", fill="black", font=font)
+img.save(sys.argv[1])
+PY
+    for combo in "--local-fast --local-no-vision" "--local-fast --local-vision" "--local-quality --local-no-vision" "--local-quality --local-vision"; do
+      # shellcheck disable=SC2086
+      read -r alias window <<EOF
+$("$WRAPPER" $combo --local-status 2>/dev/null | awk '/^model:/ { a = $NF } /^context:/ { c = $2 } END { print a, c }')
+EOF
+      case "$alias" in *-vision) img="$memdir/check.png" ;; *) img="" ;; esac
+      base="${alias%-vision}"
+      if [ "$base" = "$QUALITY_ALIAS" ] && [ ! -f "$OMLX_HOME/models/$QUALITY_DIR/config.json" ]; then continue; fi
+      info "memory test: $alias at window $window (prompt ~$(( window - 23000 )) tokens$([ -n "$img" ] && echo ' + image'))"
+      "$WRAPPER" --local-stop >/dev/null 2>&1 || true
+      # shellcheck disable=SC2086
+      "$WRAPPER" $combo --local-start >/dev/null 2>&1 || { fail "memory test: $alias did not start"; continue; }
+      expected=$(omlx_py - "$alias" "$window" "$img" "$memdir/long.json" <<'PY'
+import base64, glob, json, os, sys, sysconfig, time
+alias, window, img, out = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+target = int((window - 23000) * 3.8)   # Claude Code's largest prompt, ~3.8 characters per token
+text = f"RUN {time.time()}\n"   # unique start, so no earlier run's cache helps
 for f in sorted(glob.glob(os.path.join(sysconfig.get_paths()["stdlib"], "*.py"))):
     text += f"\n##### FILE: {os.path.basename(f)}\n" + open(f, encoding="utf-8", errors="replace").read()
     if len(text) >= target:
@@ -589,25 +1022,49 @@ for f in sorted(glob.glob(os.path.join(sysconfig.get_paths()["stdlib"], "*.py"))
 text = text[:target]
 last = text[text.rindex("##### FILE: ") + 12:].split("\n", 1)[0]
 q = "\n\nQuestion: What is the file name in the very last '##### FILE:' header above? Reply with only the file name."
-json.dump({"model": "qwen3.6-35b-a3b", "max_tokens": 200, "thinking": {"type": "disabled"},
-           "messages": [{"role": "user", "content": text + q}]}, open(sys.argv[2], "w"))
+content = [{"type": "text", "text": text + q}]
+if img:
+    data = base64.b64encode(open(img, "rb").read()).decode()
+    content.insert(0, {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}})
+json.dump({"model": alias, "max_tokens": 200, "thinking": {"type": "disabled"},
+           "messages": [{"role": "user", "content": content}]}, open(out, "w"))
 print(last)
 PY
-)
-  start=$(date +%s)
-  result=$(api /v1/messages "@$long" | "$JQ" -r '.content[0].text // .error.message // "no response"' 2>/dev/null || true)
-  secs=$(( $(date +%s) - start ))
-  peak=$(footprint -p "$(cat "$OMLX_HOME/claude-local-server.pid" 2>/dev/null)" 2>/dev/null | awk '/phys_footprint_peak:/ {print $2, $3}')
-  if [ "$result" = "$expected" ]; then pass "memory test answered correctly in $secs s (server peak ${peak:-unknown})"; else fail "memory test: expected '$expected', got '$result' (see INSTALL.md step 7)"; fi
-  rm -f "$long"
+) || { fail "memory test: $alias: couldn't build the test prompt"; continue; }
+      start=$(date +%s)
+      result=$(api /v1/messages "@$memdir/long.json" | "$JQ" -r '.content[0].text // .error.message // "no response"' 2>/dev/null || true)
+      secs=$(( $(date +%s) - start ))
+      if ! kill -0 "$(cat "$OMLX_HOME/claude-local-server.pid" 2>/dev/null)" 2>/dev/null; then
+        fail "memory test: $alias: the server exited during the prompt (likely out of memory; see INSTALL.md step 7)"
+        continue
+      fi
+      peak=$(footprint -p "$(cat "$OMLX_HOME/claude-local-server.pid" 2>/dev/null)" 2>/dev/null \
+        | awk '/phys_footprint_peak:/ { print $2, $3 }' || true)
+      case "$result" in
+        *"$expected"*) pass "memory test: $alias answered correctly in $secs s (server peak ${peak:-unknown})" ;;
+        *) fail "memory test: $alias expected '$expected', got '${result:0:160}' (see INSTALL.md step 7)" ;;
+      esac
+    done
+    rm -rf "$memdir"
+    # Leave a fresh server with the default model running, as before the test.
+    "$WRAPPER" --local-stop >/dev/null 2>&1 || true
+    "$WRAPPER" --local-fast --local-no-vision --local-start >/dev/null 2>&1 \
+      || warn "couldn't restart the server after the memory test; the next claude-local launch will start it"
+  fi
 fi
 
-if shasum -a 256 "$HOME/.claude/settings.json" "$HOME/.claude/CLAUDE.md" 2>/dev/null | diff -q - "$BASELINE/sha.txt" >/dev/null; then
+if [ "$(settings_sha)" = "$(cat "$BASELINE/sha.txt")" ]; then
   pass "normal Claude Code settings unchanged"
 else
   fail "normal Claude Code settings differ from the baseline in $BASELINE"
 fi
-if "$CLAUDE_BIN" auth status 2>&1 | diff -q - "$BASELINE/auth.txt" >/dev/null; then
+# Compare only who is logged in and how; other status fields can vary.
+login_fields() {  # the JSON fields, or the raw text if it isn't JSON
+  local raw
+  raw=$(cat)
+  printf '%s' "$raw" | "$JQ" -S '{loggedIn, authMethod, email, orgId}' 2>/dev/null || printf '%s\n' "$raw"
+}
+if [ "$("$CLAUDE_BIN" auth status 2>/dev/null | login_fields)" = "$(login_fields < "$BASELINE/auth.txt")" ]; then
   pass "normal Claude Code login unchanged"
 else
   fail "normal Claude Code login differs from the baseline in $BASELINE"
@@ -622,9 +1079,11 @@ fi
 cat <<'NEXT'
 
 Next:
-  claude-local                  interactive session (the first run asks for a theme and folder trust)
-  claude-local --local-status   server, model and memory warnings
-  claude-local --local-stop     stop the server and free ~20 GB
-In a session, /context should show about 16K of 131.1K tokens used.
+  claude-local                        interactive session, fast model (the first run asks for a theme and folder trust)
+  claude-local --local-vision         the same with image input
+  claude-local --local-quality        the slower, stronger model (if installed with --with-quality)
+  claude-local --local-status         selection, server, installed models and memory warnings
+  claude-local --local-stop           stop the server and free the model's memory
+In a session, /context should show about 16K tokens used.
 NEXT
 [ "$problems" -eq 0 ]

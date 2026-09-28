@@ -3,24 +3,32 @@
 # Automates INSTALL.md. No admin rights needed, and it never uses sudo. It is safe to
 # re-run: finished steps are skipped, and existing configs are merged rather than replaced.
 #
-# Usage: ./install-claude-local.sh [--no-verify] [--memory-test] [--force] [--help]
-#   --no-verify    install only; don't start the server or run the checks
-#   --memory-test  also run the full-context memory test (1-2 minutes, ~27 GB)
-#   --force        continue on a Mac that looks too small for this model
+# Usage: ./install-claude-local.sh [--with-quality] [--no-verify] [--memory-test] [--restart-server] [--force] [--help]
+#   --with-quality  also install the quality model, Qwen3.8-27B (17 GB more)
+#   --no-verify     install only; don't start the server or run the checks
+#   --memory-test   also test every installed model, with and without vision, at
+#                   its full context window (several minutes; restarts the server)
+#   --restart-server  restart the server (to load new models or settings) and run
+#                   the memory test even if another session seems to be using it
+#   --force         continue on a Mac that looks too small for these models
 
 set -euo pipefail
 
 OMLX_TAG="v0.7.0rc1"
-MODEL_REPO="unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit"
-MODEL_DIR_NAME="Qwen3.6-35B-A3B-UD-MLX-4bit"
-MODEL_ALIAS="qwen3.6-35b-a3b"
+FAST_REPO="unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit"
+FAST_REV="6700c3e5bdeb050a379c8d2a4133f43f3647f20f"
+FAST_DIR="Qwen3.6-35B-A3B-UD-MLX-4bit"
+FAST_ALIAS="qwen3.6-35b-a3b"
+QUALITY_REPO="Jundot/Qwen3.8-27B-oQ4e-mtp"
+QUALITY_REV="04dc5509edd8670fc78cc8c2f74bf9b77b1f2acc"
+QUALITY_DIR="Qwen3.8-27B-oQ4e-mtp"
+QUALITY_ALIAS="qwen3.8-27b"
 PORT=8765
 
 APP="$HOME/Applications/oMLX.app"
 OMLX_CLI="$APP/Contents/MacOS/omlx-cli"
 OMLX_PY_ROOT="$APP/Contents/Resources/Python"
 OMLX_HOME="$HOME/.omlx"
-MODEL_DIR="$OMLX_HOME/models/$MODEL_DIR_NAME"
 PROFILE="$HOME/.claude-local"
 WRAPPER="$HOME/.local/bin/claude-local"
 BASELINE="$HOME/claude-local-baseline"
@@ -30,15 +38,21 @@ JQ=/usr/bin/jq
 verify=1
 memory_test=0
 force=0
+restart_server=0
+with_quality=0
 for arg in "$@"; do
   case "$arg" in
+    --with-quality) with_quality=1 ;;
     --no-verify) verify=0 ;;
     --memory-test) memory_test=1 ;;
     --force) force=1 ;;
-    -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --restart-server) restart_server=1 ;;
+    -h|--help) awk 'NR > 1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
     *) echo "unknown option: $arg (see --help)" >&2; exit 2 ;;
   esac
 done
+# A quality model that is already installed is kept up to date on re-runs.
+[ -f "$OMLX_HOME/models/$QUALITY_DIR/config.json" ] && with_quality=1
 
 step() { printf '\n==> %s\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
@@ -54,6 +68,11 @@ omlx_py() {
 
 same_json() {  # same_json <a> <b>: true when both files hold the same JSON
   cmp -s <("$JQ" -S . "$1" 2>/dev/null) <("$JQ" -S . "$2" 2>/dev/null)
+}
+
+# Hashes of the normal Claude Code settings; a missing file is simply left out.
+settings_sha() {
+  shasum -a 256 "$HOME/.claude/settings.json" "$HOME/.claude/CLAUDE.md" 2>/dev/null || true
 }
 
 api() {  # api <path> <json-or-@file>: POST to the local server
@@ -80,8 +99,14 @@ CLAUDE_BIN="$HOME/.local/bin/claude"
 [ -n "$CLAUDE_BIN" ] || die "Claude Code not found. Install it first (https://code.claude.com/docs) and log in."
 info "Claude Code: $CLAUDE_BIN ($("$CLAUDE_BIN" --version 2>/dev/null | head -1))"
 
-have_model_gb=$(du -sg "$MODEL_DIR" 2>/dev/null | cut -f1 || true)
-need_gb=$(( 30 - ${have_model_gb:-0} ))
+have_fast_gb=$( { du -sgL "$OMLX_HOME/models/$FAST_DIR" "$OMLX_HOME/downloads/$FAST_DIR" 2>/dev/null || true; } \
+  | awk '{ s += $1 } END { print s + 0 }')
+need_gb=$(( 30 - have_fast_gb ))
+if [ "$with_quality" -eq 1 ]; then
+  have_quality_gb=$( { du -sgL "$OMLX_HOME/models/$QUALITY_DIR" "$OMLX_HOME/downloads/$QUALITY_DIR" 2>/dev/null || true; } \
+    | awk '{ s += $1 } END { print s + 0 }')
+  need_gb=$(( need_gb + 18 - have_quality_gb ))
+fi
 free_gb=$(df -g "$HOME" | awk 'NR == 2 {print $4}')
 [ "$free_gb" -ge "$need_gb" ] || die "Need about $need_gb GB of free disk space; only $free_gb GB free."
 info "disk: $free_gb GB free"
@@ -104,8 +129,8 @@ if [ -f "$BASELINE/sha.txt" ]; then
   info "baseline of normal Claude Code already in $BASELINE"
 else
   mkdir -p "$BASELINE"
-  shasum -a 256 "$HOME/.claude/settings.json" "$HOME/.claude/CLAUDE.md" 2>/dev/null > "$BASELINE/sha.txt" || true
-  "$CLAUDE_BIN" auth status > "$BASELINE/auth.txt" 2>&1 || true
+  settings_sha > "$BASELINE/sha.txt"
+  "$CLAUDE_BIN" auth status > "$BASELINE/auth.txt" 2>/dev/null || true
   info "recorded a baseline of normal Claude Code in $BASELINE"
 fi
 
@@ -153,34 +178,72 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-step "3/8 Downloading the model $MODEL_REPO (INSTALL.md step 3)"
-mkdir -p "$MODEL_DIR"
-curl -fsSL "https://huggingface.co/api/models/$MODEL_REPO/tree/main?recursive=true" \
-  | "$JQ" -r '.[] | select(.type == "file" and .path != ".gitattributes") | "\(.path) \(.lfs.size // .size)"' \
-  > "$MODEL_DIR/.filelist" || die "Could not list the model files on Hugging Face."
-failed=0
-while read -r f sz; do
-  out="$MODEL_DIR/$f"
-  mkdir -p "$(dirname "$out")"
-  for try in 1 2 3 4 5; do
-    [ "$(stat -f %z "$out" 2>/dev/null || echo 0)" = "$sz" ] && break
-    info "downloading $f ($(( sz / 1000000 )) MB), attempt $try"
-    curl -fL --retry 5 --retry-delay 5 -C - -o "$out" "https://huggingface.co/$MODEL_REPO/resolve/main/$f" || true
-  done
-  if [ "$(stat -f %z "$out" 2>/dev/null || echo 0)" = "$sz" ]; then
-    info "OK   $f"
-  else
-    warn "FAIL $f"
-    failed=1
+step "3/8 Downloading the models (INSTALL.md step 3)"
+
+# download_model <repo> <revision> <folder>: resumable, pinned to a revision,
+# sizes checked against Hugging Face. New downloads go to ~/.omlx/downloads
+# first and move into ~/.omlx/models when complete, so the server never sees
+# a half-finished model.
+download_model() {
+  local repo="$1" rev="$2" name="$3" dest="$OMLX_HOME/models/$3" work f sz out try failed=0
+  if [ -d "$dest" ]; then work="$dest"; else work="$OMLX_HOME/downloads/$name"; fi
+  mkdir -p "$work"
+  info "$repo @ ${rev:0:8} -> $dest"
+  curl -fsSL "https://huggingface.co/api/models/$repo/tree/$rev?recursive=true" \
+    | "$JQ" -r '.[] | select(.type == "file" and .path != ".gitattributes") | "\(.path) \(.lfs.size // .size)"' \
+    > "$work/.filelist" || die "Could not list $repo on Hugging Face."
+  while read -r f sz; do
+    out="$work/$f"
+    mkdir -p "$(dirname "$out")"
+    for try in 1 2 3 4 5; do
+      [ "$(stat -f %z "$out" 2>/dev/null || echo 0)" = "$sz" ] && break
+      info "downloading $f ($(( sz / 1000000 )) MB), attempt $try"
+      curl -fL --retry 5 --retry-delay 5 -C - -o "$out" "https://huggingface.co/$repo/resolve/$rev/$f" || true
+    done
+    if [ "$(stat -f %z "$out" 2>/dev/null || echo 0)" = "$sz" ]; then
+      info "OK   $f"
+    else
+      warn "FAIL $f"
+      failed=1
+    fi
+  done < "$work/.filelist"
+  [ "$failed" -eq 0 ] || die "Some files of $repo did not download. Re-run to resume."
+  if [ "$work" != "$dest" ]; then
+    mkdir -p "$OMLX_HOME/models"
+    mv "$work" "$dest"
+    models_changed=1
   fi
-done < "$MODEL_DIR/.filelist"
-[ "$failed" -eq 0 ] || die "Some model files did not download. Re-run to resume."
+}
+
+models_changed=0
+download_model "$FAST_REPO" "$FAST_REV" "$FAST_DIR"
+if [ "$with_quality" -eq 1 ]; then
+  download_model "$QUALITY_REPO" "$QUALITY_REV" "$QUALITY_DIR"
+else
+  info "quality model (Qwen3.8-27B) not requested; add --with-quality to install it"
+fi
+
+# Vision variants are symlinks to the same weights under another model id,
+# which oMLX serves with its vision engine.
+for name in "$FAST_DIR" "$QUALITY_DIR"; do
+  [ -f "$OMLX_HOME/models/$name/config.json" ] || continue
+  link="$OMLX_HOME/models/$name-vision"
+  if [ "$(readlink "$link" 2>/dev/null || true)" = "$name" ]; then
+    info "vision variant: $name-vision is in place"
+  elif [ -L "$link" ] || [ ! -e "$link" ]; then
+    ln -sfn "$name" "$link"
+    models_changed=1
+    info "vision variant: $name-vision -> $name"
+  else
+    warn "$link exists and is not a symlink; leaving it alone"
+  fi
+done
 
 # ---------------------------------------------------------------------------
 step "4/8 Sizing for this Mac's GPU memory budget (INSTALL.md step 7)"
 budget=$(omlx_py -c "import mlx.core as mx; print(round(mx.device_info()['max_recommended_working_set_size'] / 2**30, 1))") \
   || die "Could not read the GPU memory budget with oMLX's bundled Python."
-info "GPU budget: $budget GiB (the model's weights take 19.7 GB)"
+info "GPU budget: $budget GiB (loaded, the fast model takes 19.7 GB and the quality model 15.2 GB)"
 if awk -v b="$budget" 'BEGIN { exit !(b >= 34) }'; then
   tier="balanced"
 elif awk -v b="$budget" 'BEGIN { exit !(b >= 27) }'; then
@@ -190,7 +253,7 @@ else
   tier="aggressive"
   warn "budget below 27 GiB; long prompts will be rejected. Consider CLAUDE_LOCAL_CTX=65536 CLAUDE_LOCAL_MAX_OUT=16384."
 fi
-info "memory guard tier: $tier, Claude Code context window: 131072"
+info "memory guard tier: $tier (context windows per model: claude-local --local-status)"
 
 # ---------------------------------------------------------------------------
 step "5/8 Configuring oMLX (INSTALL.md step 4)"
@@ -204,7 +267,7 @@ if [ -f "$settings" ] && [ ! -e "$settings.pre-claude-local" ] \
   info "saved your previous settings.json as settings.json.pre-claude-local"
 fi
 if [ -f "$models" ] && [ ! -e "$models.pre-claude-local" ] \
-   && ! "$JQ" -e --arg k "$MODEL_DIR_NAME" --arg a "$MODEL_ALIAS" '.models[$k].model_alias == $a' "$models" >/dev/null 2>&1; then
+   && ! "$JQ" -e --arg k "$FAST_DIR" --arg a "$FAST_ALIAS" '.models[$k].model_alias == $a' "$models" >/dev/null 2>&1; then
   cp "$models" "$models.pre-claude-local"
   info "saved your previous model_settings.json as model_settings.json.pre-claude-local"
 fi
@@ -230,13 +293,20 @@ else
   info "updated $settings"
 fi
 
-model_entry=$(cat <<'MODEL_ENTRY'
-@@MODEL_ENTRY@@
-MODEL_ENTRY
+# Settings for every model and vision variant; entries for models that aren't
+# installed are harmless. Values already in an entry win, so your own edits
+# (such as reasoning_effort) survive re-runs; only model_alias and
+# model_type_override are always reset, because claude-local depends on them.
+model_entries=$(cat <<'MODEL_ENTRIES'
+@@MODEL_ENTRIES@@
+MODEL_ENTRIES
 )
 tmp=$(mktemp)
-"$JQ" --arg k "$MODEL_DIR_NAME" --argjson e "$model_entry" \
-  '.version //= 1 | .models[$k] = ((.models[$k] // {}) + $e)' "$models" > "$tmp"
+"$JQ" --argjson e "$model_entries" '
+    .version //= 1
+  | .models = (reduce ($e | to_entries[]) as $x ((.models // {});
+      .[$x.key] = (($x.value * (.[$x.key] // {})) + ($x.value | {model_alias, model_type_override}))))
+  ' "$models" > "$tmp"
 if same_json "$tmp" "$models"; then
   info "model_settings.json is up to date"
   rm -f "$tmp"
@@ -288,6 +358,10 @@ chmod 755 "$WRAPPER"
 # ---------------------------------------------------------------------------
 if [ "$verify" -eq 0 ]; then
   step "8/8 Skipping checks (--no-verify)"
+  if { [ "$config_changed" -eq 1 ] || [ "$models_changed" -eq 1 ]; } \
+     && [ -n "$(lsof -nP -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)" ]; then
+    warn "oMLX is running with older settings or models; run 'claude-local --local-stop' when no session is using it"
+  fi
   info "Start with: claude-local --local-start, then claude-local"
   exit 0
 fi
@@ -300,33 +374,107 @@ fail() { warn "FAIL $*"; problems=$((problems + 1)); }
 if command -v orbctl >/dev/null 2>&1 && [ "$(orbctl status 2>/dev/null)" = "Running" ]; then
   warn "OrbStack is running and can hold ~13 GB; 'orbctl stop' before long sessions"
 fi
-if [ "$config_changed" -eq 1 ] && [ -n "${pid:-}" ]; then
-  warn "oMLX was already running with older settings. Run 'claude-local --local-stop' when no session is using it, then re-run this script."
+# Is the server in use? Checked before this script sends any requests of its
+# own. A request in flight, one in the last 10 minutes, or a status that can't
+# be read all count as in use.
+server_in_use=0
+if [ -n "$(lsof -nP -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)" ]; then
+  in_flight=$(curl -fsS -m 3 -H "Authorization: Bearer local" "http://127.0.0.1:$PORT/api/status" 2>/dev/null \
+    | "$JQ" -r '(.active_requests // 0) + (.waiting_requests // 0)' 2>/dev/null || echo unknown)
+  recent=$(curl -fsS -m 3 -H "Authorization: Bearer local" "http://127.0.0.1:$PORT/v1/models/status" 2>/dev/null \
+    | "$JQ" -r --argjson now "$(date +%s)" '[.models[]? | select(.last_access != null and ($now - .last_access) < 600)] | length' 2>/dev/null || echo unknown)
+  if [ "$in_flight" != "0" ] || [ "$recent" != "0" ]; then server_in_use=1; fi
+fi
+# A server started before this install doesn't know new models or settings.
+if { [ "$config_changed" -eq 1 ] || [ "$models_changed" -eq 1 ]; } \
+   && [ -n "$(lsof -nP -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)" ]; then
+  if [ "$server_in_use" -eq 0 ] || [ "$restart_server" -eq 1 ]; then
+    info "restarting oMLX so it loads the new settings and models"
+    "$WRAPPER" --local-stop >/dev/null 2>&1 || true
+  else
+    warn "oMLX is running with older settings or models and looks busy (a request in flight or in the last 10 minutes, perhaps from an earlier run of this script), so it wasn't restarted. Checks of new models may fail; re-run with --restart-server when it's free."
+  fi
 fi
 
-info "starting the server and loading the model (about 10-15 s the first time)"
-if "$WRAPPER" --local-start >/dev/null; then pass "server up at http://127.0.0.1:$PORT with $MODEL_ALIAS"; else fail "server did not start; see ~/.omlx/logs/claude-local-server.log"; fi
+info "starting the server and loading the fast model (about 10-15 s the first time)"
+if "$WRAPPER" --local-fast --local-no-vision --local-start >/dev/null; then pass "server up at http://127.0.0.1:$PORT with $FAST_ALIAS"; else fail "server did not start; see ~/.omlx/logs/claude-local-server.log"; fi
 
-answer=$(api /v1/messages '{"model":"'"$MODEL_ALIAS"'","max_tokens":2000,"thinking":{"type":"adaptive"},"messages":[{"role":"user","content":"What is 17*23? Answer with just the number."}]}' \
+answer=$(api /v1/messages '{"model":"'"$FAST_ALIAS"'","max_tokens":2000,"thinking":{"type":"adaptive"},"messages":[{"role":"user","content":"What is 17*23? Answer with just the number."}]}' \
   | "$JQ" -r '[.content[]? | select(.type == "text") | .text] | join("")' 2>/dev/null || true)
 case "$answer" in *391*) pass "API answers correctly (17*23 = 391)" ;; *) fail "API check: expected 391, got '$answer'" ;; esac
 
-call=$(api /v1/messages '{"model":"'"$MODEL_ALIAS"'","max_tokens":4000,"thinking":{"type":"adaptive"},"tools":[{"name":"Bash","description":"Run a shell command.","input_schema":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}],"messages":[{"role":"user","content":"List the files in /tmp using the Bash tool."}]}' \
+call=$(api /v1/messages '{"model":"'"$FAST_ALIAS"'","max_tokens":4000,"thinking":{"type":"adaptive"},"tools":[{"name":"Bash","description":"Run a shell command.","input_schema":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}],"messages":[{"role":"user","content":"List the files in /tmp using the Bash tool."}]}' \
   | "$JQ" -r '"\(.stop_reason) \([.content[]? | select(.type == "tool_use") | .name] | join(","))"' 2>/dev/null || true)
 case "$call" in "tool_use Bash"*) pass "tool calling works" ;; *) fail "tool-call check: got '$call'" ;; esac
 
 testdir=$(mktemp -d)
 reply=$(cd "$testdir" && "$WRAPPER" -p "Reply with exactly the word OK and nothing else." 2>&1 || true)
 case "$reply" in *OK*) pass "claude-local -p works" ;; *) fail "claude-local -p: $(printf '%s' "$reply" | tail -3)" ;; esac
+
+# Vision: a generated image with a number the model has to read.
+omlx_py - "$testdir/check.png" <<'PY'
+import sys
+from PIL import Image, ImageDraw, ImageFont
+img = Image.new("RGB", (640, 400), "white")
+try:
+    font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial Bold.ttf", 72)
+except OSError:
+    font = ImageFont.load_default()
+ImageDraw.Draw(img).text((200, 150), "4821", fill="black", font=font)
+img.save(sys.argv[1])
+PY
+seen=$(printf '{"model":"%s-vision","max_tokens":2000,"thinking":{"type":"adaptive"},"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"%s"}},{"type":"text","text":"What number is written in this image? Reply with just the number."}]}]}' \
+    "$FAST_ALIAS" "$(base64 -i "$testdir/check.png" | tr -d '\n')" > "$testdir/vision.json" \
+  && api /v1/messages "@$testdir/vision.json" | "$JQ" -r '[.content[]? | select(.type == "text") | .text] | join("")' 2>/dev/null || true)
+case "$seen" in *4821*) pass "vision works (fast model read 4821 from an image)" ;; *) fail "vision check: expected 4821, got '$seen'" ;; esac
+
+if [ -f "$OMLX_HOME/models/$QUALITY_DIR/config.json" ]; then
+  curl -fsS -m 5 -H "Authorization: Bearer local" "http://127.0.0.1:$PORT/v1/models" 2>/dev/null \
+    | "$JQ" -e --arg a "$QUALITY_ALIAS" 'any(.data[]?; .id == $a)' >/dev/null 2>&1 \
+    || fail "oMLX doesn't list $QUALITY_ALIAS yet; re-run with --restart-server so it rescans its models"
+  info "loading the quality model (swaps out the fast model)"
+  answer=$(api /v1/messages '{"model":"'"$QUALITY_ALIAS"'","max_tokens":4000,"thinking":{"type":"adaptive"},"messages":[{"role":"user","content":"What is 17*23? Answer with just the number."}]}' \
+    | "$JQ" -r '[.content[]? | select(.type == "text") | .text] | join("")' 2>/dev/null || true)
+  case "$answer" in *391*) pass "quality model answers correctly (17*23 = 391)" ;; *) fail "quality check: expected 391, got '$answer'" ;; esac
+fi
 rm -rf "$testdir"
 
+# Memory test: one prompt at Claude Code's largest size for each installed
+# combination's window (window - 23000 tokens), vision combinations with an
+# image, on a freshly started server so the peak is this prompt's alone.
 if [ "$memory_test" -eq 1 ]; then
-  info "memory test: one prompt at Claude Code's largest size for a 131072 window (~108K tokens)"
-  long=$(mktemp)
-  expected=$(omlx_py - 131072 "$long" <<'PY'
-import glob, json, os, sys, sysconfig
-target = int((int(sys.argv[1]) - 23000) * 3.8)
-text = ""
+  if [ "$server_in_use" -eq 1 ] && [ "$restart_server" -eq 0 ]; then
+    warn "skipping the memory test: the server looked busy before this run (a request in flight or in the last 10 minutes, perhaps from an earlier run of this script); use --restart-server to run it anyway"
+  else
+    memdir=$(mktemp -d)
+    omlx_py - "$memdir/check.png" <<'PY'
+import sys
+from PIL import Image, ImageDraw, ImageFont
+img = Image.new("RGB", (640, 400), "white")
+try:
+    font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial Bold.ttf", 72)
+except OSError:
+    font = ImageFont.load_default()
+ImageDraw.Draw(img).text((200, 150), "4821", fill="black", font=font)
+img.save(sys.argv[1])
+PY
+    for combo in "--local-fast --local-no-vision" "--local-fast --local-vision" "--local-quality --local-no-vision" "--local-quality --local-vision"; do
+      # shellcheck disable=SC2086
+      read -r alias window <<EOF
+$("$WRAPPER" $combo --local-status 2>/dev/null | awk '/^model:/ { a = $NF } /^context:/ { c = $2 } END { print a, c }')
+EOF
+      case "$alias" in *-vision) img="$memdir/check.png" ;; *) img="" ;; esac
+      base="${alias%-vision}"
+      if [ "$base" = "$QUALITY_ALIAS" ] && [ ! -f "$OMLX_HOME/models/$QUALITY_DIR/config.json" ]; then continue; fi
+      info "memory test: $alias at window $window (prompt ~$(( window - 23000 )) tokens$([ -n "$img" ] && echo ' + image'))"
+      "$WRAPPER" --local-stop >/dev/null 2>&1 || true
+      # shellcheck disable=SC2086
+      "$WRAPPER" $combo --local-start >/dev/null 2>&1 || { fail "memory test: $alias did not start"; continue; }
+      expected=$(omlx_py - "$alias" "$window" "$img" "$memdir/long.json" <<'PY'
+import base64, glob, json, os, sys, sysconfig, time
+alias, window, img, out = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+target = int((window - 23000) * 3.8)   # Claude Code's largest prompt, ~3.8 characters per token
+text = f"RUN {time.time()}\n"   # unique start, so no earlier run's cache helps
 for f in sorted(glob.glob(os.path.join(sysconfig.get_paths()["stdlib"], "*.py"))):
     text += f"\n##### FILE: {os.path.basename(f)}\n" + open(f, encoding="utf-8", errors="replace").read()
     if len(text) >= target:
@@ -334,25 +482,49 @@ for f in sorted(glob.glob(os.path.join(sysconfig.get_paths()["stdlib"], "*.py"))
 text = text[:target]
 last = text[text.rindex("##### FILE: ") + 12:].split("\n", 1)[0]
 q = "\n\nQuestion: What is the file name in the very last '##### FILE:' header above? Reply with only the file name."
-json.dump({"model": "qwen3.6-35b-a3b", "max_tokens": 200, "thinking": {"type": "disabled"},
-           "messages": [{"role": "user", "content": text + q}]}, open(sys.argv[2], "w"))
+content = [{"type": "text", "text": text + q}]
+if img:
+    data = base64.b64encode(open(img, "rb").read()).decode()
+    content.insert(0, {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}})
+json.dump({"model": alias, "max_tokens": 200, "thinking": {"type": "disabled"},
+           "messages": [{"role": "user", "content": content}]}, open(out, "w"))
 print(last)
 PY
-)
-  start=$(date +%s)
-  result=$(api /v1/messages "@$long" | "$JQ" -r '.content[0].text // .error.message // "no response"' 2>/dev/null || true)
-  secs=$(( $(date +%s) - start ))
-  peak=$(footprint -p "$(cat "$OMLX_HOME/claude-local-server.pid" 2>/dev/null)" 2>/dev/null | awk '/phys_footprint_peak:/ {print $2, $3}')
-  if [ "$result" = "$expected" ]; then pass "memory test answered correctly in $secs s (server peak ${peak:-unknown})"; else fail "memory test: expected '$expected', got '$result' (see INSTALL.md step 7)"; fi
-  rm -f "$long"
+) || { fail "memory test: $alias: couldn't build the test prompt"; continue; }
+      start=$(date +%s)
+      result=$(api /v1/messages "@$memdir/long.json" | "$JQ" -r '.content[0].text // .error.message // "no response"' 2>/dev/null || true)
+      secs=$(( $(date +%s) - start ))
+      if ! kill -0 "$(cat "$OMLX_HOME/claude-local-server.pid" 2>/dev/null)" 2>/dev/null; then
+        fail "memory test: $alias: the server exited during the prompt (likely out of memory; see INSTALL.md step 7)"
+        continue
+      fi
+      peak=$(footprint -p "$(cat "$OMLX_HOME/claude-local-server.pid" 2>/dev/null)" 2>/dev/null \
+        | awk '/phys_footprint_peak:/ { print $2, $3 }' || true)
+      case "$result" in
+        *"$expected"*) pass "memory test: $alias answered correctly in $secs s (server peak ${peak:-unknown})" ;;
+        *) fail "memory test: $alias expected '$expected', got '${result:0:160}' (see INSTALL.md step 7)" ;;
+      esac
+    done
+    rm -rf "$memdir"
+    # Leave a fresh server with the default model running, as before the test.
+    "$WRAPPER" --local-stop >/dev/null 2>&1 || true
+    "$WRAPPER" --local-fast --local-no-vision --local-start >/dev/null 2>&1 \
+      || warn "couldn't restart the server after the memory test; the next claude-local launch will start it"
+  fi
 fi
 
-if shasum -a 256 "$HOME/.claude/settings.json" "$HOME/.claude/CLAUDE.md" 2>/dev/null | diff -q - "$BASELINE/sha.txt" >/dev/null; then
+if [ "$(settings_sha)" = "$(cat "$BASELINE/sha.txt")" ]; then
   pass "normal Claude Code settings unchanged"
 else
   fail "normal Claude Code settings differ from the baseline in $BASELINE"
 fi
-if "$CLAUDE_BIN" auth status 2>&1 | diff -q - "$BASELINE/auth.txt" >/dev/null; then
+# Compare only who is logged in and how; other status fields can vary.
+login_fields() {  # the JSON fields, or the raw text if it isn't JSON
+  local raw
+  raw=$(cat)
+  printf '%s' "$raw" | "$JQ" -S '{loggedIn, authMethod, email, orgId}' 2>/dev/null || printf '%s\n' "$raw"
+}
+if [ "$("$CLAUDE_BIN" auth status 2>/dev/null | login_fields)" = "$(login_fields < "$BASELINE/auth.txt")" ]; then
   pass "normal Claude Code login unchanged"
 else
   fail "normal Claude Code login differs from the baseline in $BASELINE"
@@ -367,9 +539,11 @@ fi
 cat <<'NEXT'
 
 Next:
-  claude-local                  interactive session (the first run asks for a theme and folder trust)
-  claude-local --local-status   server, model and memory warnings
-  claude-local --local-stop     stop the server and free ~20 GB
-In a session, /context should show about 16K of 131.1K tokens used.
+  claude-local                        interactive session, fast model (the first run asks for a theme and folder trust)
+  claude-local --local-vision         the same with image input
+  claude-local --local-quality        the slower, stronger model (if installed with --with-quality)
+  claude-local --local-status         selection, server, installed models and memory warnings
+  claude-local --local-stop           stop the server and free the model's memory
+In a session, /context should show about 16K tokens used.
 NEXT
 [ "$problems" -eq 0 ]

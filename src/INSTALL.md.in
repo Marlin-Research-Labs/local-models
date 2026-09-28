@@ -9,7 +9,8 @@ Tested on September 27, 2026 with:
 | Mac | MacBook Pro, Apple M5 Max (32-core GPU), 36 GB, macOS 27.0 |
 | Claude Code | 2.1.283, native installer (`~/.local/bin/claude`) |
 | Inference server | oMLX 0.7.0rc1 (`oMLX-0.7.0rc1-macos26-27.dmg`) |
-| Model | `unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit` (21.66 GB) |
+| Fast model (default) | `unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit` (21.66 GB) |
+| Quality model (optional) | `Jundot/Qwen3.8-27B-oQ4e-mtp` (16.99 GB) |
 
 What you end up with:
 
@@ -18,7 +19,19 @@ What you end up with:
 | Wrapper command | `~/.local/bin/claude-local` |
 | Claude Code profile for local sessions | `~/.claude-local/` (its own settings, history, sessions and Keychain entry) |
 | Inference server app | `~/Applications/oMLX.app`, run headless by the wrapper on `127.0.0.1:8765` |
-| Server config, model, cache, logs | `~/.omlx/` |
+| Server config, models, cache, logs | `~/.omlx/` |
+| Saved model and vision defaults | `~/.config/claude-local/defaults` (or `$XDG_CONFIG_HOME/claude-local/defaults` if you set that), only if you save one |
+
+Each launch picks a model and whether image input (vision) is on:
+
+| Choice | Model | Context window | Generation | Best for |
+|---|---|---|---|---|
+| `claude-local` | fast, text only | 128K | ~70–90 tok/s | Everyday coding (the default) |
+| `claude-local --local-vision` | fast, with images | 104K | ~70–90 tok/s | Screenshots, diagrams, UI work |
+| `claude-local --local-quality` | quality, text only | 92K | ~20–45 tok/s | Harder tasks where speed matters less |
+| `claude-local --local-quality --local-vision` | quality, with images | 80K | ~20–45 tok/s | Harder tasks with images |
+
+Only one model fits in memory at a time; switching between them takes about 5–15 s the first time.
 
 > **Privacy note.** Inference is local, but any organization-managed Claude Code settings still apply to `claude-local`: hooks, telemetry and so on, under `/Library/Application Support/ClaudeCode/managed-settings.json`. On a managed Mac, prompts and tool events may still leave the machine exactly as they do with normal `claude`. Nothing in this guide bypasses managed settings. Never "fix" this with `--bare` or `CLAUDE_CODE_SIMPLE`.
 
@@ -28,13 +41,22 @@ What you end up with:
 
 ```sh
 chmod +x install-claude-local.sh
-./install-claude-local.sh                  # install, then run the quick checks (about 1 minute after downloads)
-./install-claude-local.sh --memory-test    # also run the full-context memory test from step 8g
-./install-claude-local.sh --no-verify      # install only
+./install-claude-local.sh
 ```
+
+| Command | What it does |
+|---|---|
+| `./install-claude-local.sh` | Fast model, then the quick checks (about 1 minute after downloads) |
+| `./install-claude-local.sh --with-quality` | Also the quality model (17 GB more); safe to add later |
+| `./install-claude-local.sh --memory-test` | Also test every installed model and vision setting at full context |
+| `./install-claude-local.sh --no-verify` | Install only |
+| `./install-claude-local.sh --restart-server` | Restart the server to load new models even if it looks busy |
 
 What the script does:
 - Checks the Mac first. It stops if the Mac has less than 36 GB of memory unless you pass `--force`.
+- Restarts the server only when it has new models or settings and no session seems to be using it. A request in flight, one in the last 10 minutes, or a status it can't read counts as in use; `--restart-server` overrides this.
+- Downloads models pinned to exact Hugging Face revisions and checks every file's size. New downloads land in `~/.omlx/downloads` and move into `~/.omlx/models` only when complete.
+- Sets up the vision variants (symlinks, no extra disk).
 - Verifies the oMLX download's SHA-256 and Apple's signature and notarization.
 - Picks the memory guard tier from the Mac's GPU budget.
 - Skips anything already done: a matching oMLX version, model files already complete, configs already set.
@@ -54,15 +76,27 @@ All commands are for Terminal (zsh), run as your normal user. Run each step's bl
 ### 1. Check the Mac
 
 ```sh
-sysctl -n machdep.cpu.brand_string                           # needs Apple Silicon
-echo "$(( $(sysctl -n hw.memsize) / 1073741824 )) GB RAM"     # see sizing in step 7
+sysctl -n machdep.cpu.brand_string
+echo "$(( $(sysctl -n hw.memsize) / 1073741824 )) GB RAM"
 system_profiler SPDisplaysDataType | grep -m1 "Total Number of Cores"
-sw_vers -productVersion                                      # 26.x/27.x (macOS 15 also works, see step 2)
-ls -l ~/.local/bin/claude && claude --version                # Claude Code native install
-/usr/bin/jq --version                                        # ships with macOS 15 and later
-df -h ~ | tail -1                                            # need ~25 GB now, up to 50 GB more for cache
+sw_vers -productVersion
+ls -l ~/.local/bin/claude && claude --version
+/usr/bin/jq --version
+df -h ~ | tail -1
 lsof -nP -iTCP:8765 -sTCP:LISTEN || echo "port 8765 is free"
 ```
+
+Look for, in order:
+- an Apple chip;
+- at least 36 GB of memory (see step 7);
+- the GPU core count;
+- macOS 26 or 27 (macOS 15 also works; see step 2);
+- the Claude Code native install;
+- a `jq` version, since `jq` ships with macOS 15 and later;
+- at least ~25 GB free (plus 17 GB for the quality model, and up to 50 GB more for the prompt cache);
+- port 8765 free.
+
+> **Pasting into zsh:** the blocks in this guide have no `#` comments, because zsh doesn't treat `#` as a comment when you paste unless `setopt interactivecomments` is on. Explanations are in the text around each block.
 
 Requirements:
 - **Apple Silicon with at least 36 GB of memory.** Step 7 explains how to size this for other Macs. A 32 GB Mac is not enough for this model at a usable context.
@@ -92,18 +126,23 @@ echo "$DMG_URL"
 
 mkdir -p ~/Downloads/omlx && cd ~/Downloads/omlx
 curl -fL --retry 3 -C - -o "omlx-$OMLX_TAG.dmg" "$DMG_URL"
-echo "$DMG_SHA  omlx-$OMLX_TAG.dmg" | shasum -a 256 -c -      # must print: OK
+echo "$DMG_SHA  omlx-$OMLX_TAG.dmg" | shasum -a 256 -c -
 
 MNT=$(mktemp -d)
 hdiutil attach -nobrowse -readonly -mountpoint "$MNT" "omlx-$OMLX_TAG.dmg"
 codesign --verify --deep --strict "$MNT/oMLX.app" && echo "signature OK"
-spctl -a -vv -t exec "$MNT/oMLX.app"                         # expect: accepted, Notarized Developer ID
+spctl -a -vv -t exec "$MNT/oMLX.app"
 mkdir -p ~/Applications
 ditto "$MNT/oMLX.app" ~/Applications/oMLX.app
 hdiutil detach "$MNT"
 cd ~
-~/Applications/oMLX.app/Contents/MacOS/omlx-cli --version     # expect: 0.7.0rc1
+~/Applications/oMLX.app/Contents/MacOS/omlx-cli --version
 ```
+
+Expect three results:
+- `shasum` prints `OK`.
+- `spctl` prints `accepted` and `Notarized Developer ID`.
+- The last line prints `0.7.0rc1`.
 
 On macOS 27, `hdiutil` prints a deprecation warning suggesting `diskutil image`. The commands still work, and `hdiutil` also works on macOS 15.
 
@@ -113,26 +152,47 @@ For reference, the macOS 26/27 DMG for 0.7.0rc1 has SHA-256 `82c1ea4d882153bb2da
 >
 > If macOS says the app is damaged, re-download it. If your endpoint security blocks the app, ask IT to allow `app.omlx` (team `PSK5Q5T46L`).
 
-### 3. Download the model (~21.7 GB, resumable)
+### 3. Download the models (resumable)
+
+This defines a small download function, `get_model <repo> <revision> <folder>`, then fetches the fast model (21.66 GB) and, optionally, the quality model (16.99 GB). Both are pinned to the exact Hugging Face revisions that were tested. Don't start the server until the downloads finish.
 
 ```sh
-REPO=unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit
-DEST=~/.omlx/models/Qwen3.6-35B-A3B-UD-MLX-4bit
-mkdir -p "$DEST"
-curl -fsSL "https://huggingface.co/api/models/$REPO/tree/main?recursive=true" \
-  | /usr/bin/jq -r '.[] | select(.type == "file" and .path != ".gitattributes") | "\(.path) \(.lfs.size // .size)"' \
-  > "$DEST/.filelist"
-while read -r f sz; do
-  out="$DEST/$f"; mkdir -p "$(dirname "$out")"
-  for try in 1 2 3 4 5; do
-    [ "$(stat -f %z "$out" 2>/dev/null || echo 0)" = "$sz" ] && break
-    curl -fL --retry 5 --retry-delay 5 -C - -o "$out" "https://huggingface.co/$REPO/resolve/main/$f"
-  done
-  if [ "$(stat -f %z "$out" 2>/dev/null || echo 0)" = "$sz" ]; then echo "OK   $f"; else echo "FAIL $f"; fi
-done < "$DEST/.filelist"
+get_model() {
+  local repo=$1 rev=$2 dest=~/.omlx/models/$3
+  mkdir -p "$dest"
+  curl -fsSL "https://huggingface.co/api/models/$repo/tree/$rev?recursive=true" \
+    | /usr/bin/jq -r '.[] | select(.type == "file" and .path != ".gitattributes") | "\(.path) \(.lfs.size // .size)"' \
+    > "$dest/.filelist"
+  while read -r f sz; do
+    out="$dest/$f"; mkdir -p "$(dirname "$out")"
+    for try in 1 2 3 4 5; do
+      [ "$(stat -f %z "$out" 2>/dev/null || echo 0)" = "$sz" ] && break
+      curl -fL --retry 5 --retry-delay 5 -C - -o "$out" "https://huggingface.co/$repo/resolve/$rev/$f"
+    done
+    if [ "$(stat -f %z "$out" 2>/dev/null || echo 0)" = "$sz" ]; then echo "OK   $f"; else echo "FAIL $f"; fi
+  done < "$dest/.filelist"
+}
+
+get_model unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit 6700c3e5bdeb050a379c8d2a4133f43f3647f20f Qwen3.6-35B-A3B-UD-MLX-4bit
+
 ```
 
-Every line must say `OK`. If any say `FAIL`, run the block again; it resumes where it stopped. The five `model-0000N-of-00005.safetensors` files make up almost all of the 21.66 GB.
+Optionally, the quality model:
+
+```sh
+get_model Jundot/Qwen3.8-27B-oQ4e-mtp 04dc5509edd8670fc78cc8c2f74bf9b77b1f2acc Qwen3.8-27B-oQ4e-mtp
+```
+
+Every line must say `OK`. If any say `FAIL`, run that `get_model` line again; it resumes where it stopped.
+
+Then create the vision variants. Each is a symlink to the same weights under a second folder name, which oMLX treats as a separate model and serves with its vision engine:
+
+```sh
+cd ~/.omlx/models
+ln -sfn Qwen3.6-35B-A3B-UD-MLX-4bit Qwen3.6-35B-A3B-UD-MLX-4bit-vision
+[ -d Qwen3.8-27B-oQ4e-mtp ] && ln -sfn Qwen3.8-27B-oQ4e-mtp Qwen3.8-27B-oQ4e-mtp-vision
+cd ~
+```
 
 ### 4. Configure oMLX
 
@@ -179,13 +239,16 @@ What these settings do:
 | `host` 127.0.0.1, `port` 8765 | Local only. Port 8765 avoids the common dev-server port 8000. |
 | `max_concurrent_requests` 1 | One generation at a time. Parallel requests would each need their own KV cache and would evict the prefix cache. oMLX's default is 8. |
 | `ssd_cache_max_size` 50GB | The prefix cache lives on the SSD. The default would take about half the free disk. |
-| `memory_guard_tier` aggressive | Lets a prompt use up to 95% of the GPU budget instead of 90%. Needed for a 128K window on a 36 GB Mac (step 7). |
-| `model_type_override` llm | Loads the model text-only, skipping its 0.9 GB vision tower (resident size 19.7 GB instead of 20.8 GB). |
-| `model_alias` qwen3.6-35b-a3b | The name Claude Code uses. It must **not** start with `claude-`, or Claude Code ignores its context-window override. |
-| `max_context_window` 163840 | The server-side limit. It is larger than Claude Code's 131072 window so tokenizer differences never cause rejections. |
-| Sampling 0.6 / 0.95 / 20 / 0 / 0 | Qwen's recommended "thinking mode, precise coding" settings. Claude Code sends no temperature while thinking is on, so these apply. |
+| `memory_guard_tier` aggressive | Lets a prompt use up to 95% of the GPU budget instead of 90%. Needed for the context windows in step 7 on a 36 GB Mac. |
+| `model_type_override` llm / vlm | `llm` loads a model text-only, skipping its vision tower (the fast model then takes 19.7 GB instead of 20.8 GB). The `-vision` entries use `vlm`, oMLX's vision engine. |
+| `model_alias` | The names Claude Code uses: `qwen3.6-35b-a3b`, `qwen3.8-27b`, and each with `-vision`. They must **not** start with `claude-`, or Claude Code ignores its context-window override. |
+| `max_context_window` 163840 | The server-side limit. It is larger than any window Claude Code is given, so tokenizer differences never cause rejections; the memory guard is what really limits context. |
+| Fast sampling 0.6 / 0.95 / 20 / 0 / 0 | Qwen's recommended "thinking mode, precise coding" settings for Qwen3.6. Claude Code sends no temperature while thinking is on, so these apply. |
+| Quality sampling 1.0 / 0.95 / 20 / 0 / 0 | Qwen's recommended thinking-mode settings for Qwen3.8, which its benchmarks used. |
+| Quality `reasoning_effort` medium | Qwen3.8 defaults to `xhigh`, which can think for minutes on hard prompts at this model's speed. On a test coding task `xhigh` took 73 s against 57 s for `medium`, with the same result. Set it to `xhigh` here if you want Qwen's default. Claude Code's `/effort` setting doesn't reach it. |
+| Quality `mtp_enabled` true (text only) | Qwen3.8's multi-token-prediction head drafts about 3.6 tokens per step (88–97% accepted). It's left off for the vision variant until that's been verified. |
 | `enable_thinking`, `preserve_thinking` true | Keeps reasoning across turns, which Qwen recommends for agents and which keeps the prompt prefix stable for caching. |
-| `ttl_seconds` 1800 | Unloads the ~20 GB model after 30 minutes idle. The server process stays up and is small. |
+| `ttl_seconds` 1800 | Unloads a model after 30 minutes idle. The server process stays up and is small. |
 
 ### 5. Create the isolated Claude Code profile
 
@@ -222,10 +285,22 @@ claude-local --local-status
 
 What the wrapper does:
 
+- **Model and vision selection** (wrapper options must come before any Claude Code arguments):
+  - `--local-fast` / `--local-quality` and `--local-vision` / `--local-no-vision` choose for one launch.
+  - `CLAUDE_LOCAL_PROFILE=fast|quality` and `CLAUDE_LOCAL_VISION=on|off` do the same from the environment.
+  - `--local-set-default` saves the options given with it to `~/.config/claude-local/defaults` (or `$XDG_CONFIG_HOME/claude-local/defaults` if you set that).
+  - Precedence: option, then environment, then saved default, then built-in (fast, vision off).
+  - One table in the script maps each combination to its oMLX model, measured context window, output cap and any model-specific Claude Code settings.
 - **On each launch:**
   - Warns if OrbStack's VM, Ollama or LM Studio are holding memory.
+  - Warns if a different model was used in the last 10 minutes, probably by another session, since this launch will swap it out.
   - Starts the oMLX server if it isn't running, in its own process group so Ctrl-C in Claude Code can't kill it.
-  - Waits until the model is listed.
+  - Waits until the model is listed, and stops with a hint if the quality model isn't installed.
+- **Images:** with vision off, oMLX silently drops images. So the wrapper adds a hook, for that session only, that refuses Claude Code's Read tool on `.png`, `.jpg`, `.jpeg`, `.gif` and `.webp` files, with a message telling the model to suggest `--local-vision`.
+  - In testing, the model then stopped and told the user to relaunch.
+  - Glob and Grep still see image files. Deny rules were tried first, but they also hid image files from those tools.
+  - Pasted images can't be refused; the model simply won't see them.
+- **Quality model only:** it sets `CLAUDE_CODE_MODEL_CAPABILITIES=-mid_conv_system` (undocumented), because Qwen3.8's chat template rejects system messages after the first one. It also caps output at 20K tokens so long reasoning can't push the cache past the window.
 - **For the Claude Code process only (nothing global), it sets:**
   - the local endpoint and a dummy token;
   - every model tier mapped to the one local model;
@@ -236,9 +311,9 @@ What the wrapper does:
 - **Tools and MCP:** WebSearch (an Anthropic server-side tool) and LSP are disabled, and MCP servers are off (`--strict-mcp-config`). Pass `--mcp-config <file>` to add servers for one session.
 - **Subcommands** such as `claude-local mcp list` or `claude-local doctor` pass straight through to Claude Code.
 
-### 7. Size the context window for this Mac
+### 7. Size the context windows for this Mac
 
-The model's weights take 19.7 GB. What remains of macOS's GPU memory budget decides how long a context fits. Read the budget with oMLX's bundled Python:
+What remains of macOS's GPU memory budget after a model's weights decides how long a context fits. Read the budget with oMLX's bundled Python:
 
 ```sh
 OMLX_RES=~/Applications/oMLX.app/Contents/Resources/Python
@@ -247,16 +322,27 @@ PYTHONHOME=$OMLX_RES/cpython-3.11 PYTHONPATH=$OMLX_RES/framework-mlx-base/lib/py
   print('GPU budget:', round(i['max_recommended_working_set_size'] / 2**30, 1), 'GiB of', round(i['memory_size'] / 2**30), 'GiB')"
 ```
 
-| GPU budget | `memory_guard_tier` | `CLAUDE_LOCAL_CTX` | Status |
+Measured on the tested Mac (28.1 GiB budget, `aggressive` guard). Each window was tested cold, on a freshly started server, with the largest prompt Claude Code sends at that window, which is the window minus about 23K tokens:
+
+| Model | Vision | Weights loaded | Window (`row_ctx`) | Largest prompt tested | Time | Peak | Rejected from |
+|---|---|---|---|---|---|---|---|
+| fast | off | 19.7 GB | 131072 | 105.7K | 67 s | 26 GB | varies near 130K |
+| fast | on | 20.8 GB | 106496 | 83.3K + image | 43 s | 26 GB | ~90K |
+| quality | off | 15.2 GB | 94208 | 69.5K | 155 s | 26 GB | ~75K |
+| quality | on | 17.5 GB | 81920 | 57.2K + image | 108 s | 26 GB | not reached |
+
+The quality model's weights are smaller, but its attention cache is 3.2× larger per token (64 KiB against 20 KiB), so it fits less context. With the `balanced` guard, the fast model was rejected from ~78K.
+
+For other Macs:
+
+| GPU budget | `memory_guard_tier` | Windows | Status |
 |---|---|---|---|
-| ≥ 34 GiB (typically 48 GB Macs and up) | `balanced` or `aggressive` | 131072 | Expected to fit comfortably (not tested) |
-| ~28 GiB (36 GB Macs) | `aggressive` | 131072 | **Tested.** The largest prompt Claude Code sends at this window (~108K tokens) works: 55 s cold, 5 s when the prefix is cached. Raw prompts near 131K were sometimes accepted and sometimes rejected by the guard, depending on other memory use. With `balanced`, prompts were rejected from ~78K. |
-| < 27 GiB (32 GB Macs and below) | — | — | Not supported by this guide. Claude Code needs ≥ 64K of context, and there isn't room for it next to this model. |
+| ≥ 34 GiB (typically 48 GB Macs and up) | `balanced` or `aggressive` | the ones above, or larger | Expected to fit comfortably (not tested) |
+| ~28 GiB (36 GB Macs) | `aggressive` | the ones above | **Tested** |
+| < 27 GiB (32 GB Macs and below) | — | — | Not supported by this guide. Claude Code needs ≥ 64K of context, and there isn't room for it next to these models. |
 
-Rough rule from the measurement: during prompt processing the server's footprint grows by about 0.05 GB per 1K tokens of context on top of the weights. The guard allows up to 95% of the budget (`aggressive`) or 90% (`balanced`).
-
-- **Changing the window:** edit the `ctx="${CLAUDE_LOCAL_CTX:-131072}"` line in `~/.local/bin/claude-local`. Keep `max_context_window` in `~/.omlx/model_settings.json` larger than it.
-- **Below 131072:** also set `CLAUDE_LOCAL_MAX_OUT` to 16384.
+- **Changing a window:** edit the `row_ctx=` value for that combination in the `profile_row` table in `~/.local/bin/claude-local` (or `src/claude-local` in the repo), or set `CLAUDE_LOCAL_CTX` for one launch. Keep `max_context_window` in `~/.omlx/model_settings.json` larger.
+- **Output caps:** below a 20K output cap, Claude Code compacts at the window minus the cap minus 13K, so small windows need a small cap too (`CLAUDE_LOCAL_MAX_OUT`).
 - **Not below 65536:** Claude Code's own prompt and tools take about 16K tokens, and it reserves about 33K before auto-compacting.
 - **Don't raise the budget:** don't raise `iogpu.wired_limit_mb` with sudo to work around this. It affects the whole system and needs admin rights.
 
@@ -292,6 +378,32 @@ curl -sS http://127.0.0.1:8765/v1/messages -H "Authorization: Bearer local" \
   | /usr/bin/jq '{stop_reason, calls: [.content[] | select(.type == "tool_use") | {name, input}]}'
 ```
 
+**c2. Vision check.** Draw a number and ask the vision model to read it. Expect `4821`. (Images need to be reasonably large: at 480×200 pixels the model got too few image tokens and read "481"; 640×400 and up worked.)
+
+```sh
+OMLX_RES=~/Applications/oMLX.app/Contents/Resources/Python
+PYTHONHOME=$OMLX_RES/cpython-3.11 PYTHONPATH=$OMLX_RES/framework-mlx-base/lib/python3.11/site-packages \
+  "$OMLX_RES/cpython-3.11/bin/python3" -c "from PIL import Image, ImageDraw, ImageFont
+img = Image.new('RGB', (640, 400), 'white')
+ImageDraw.Draw(img).text((200, 150), '4821', fill='black', font=ImageFont.truetype('/System/Library/Fonts/Supplemental/Arial Bold.ttf', 72))
+img.save('/tmp/claude-local-4821.png')"
+printf '{"model":"qwen3.6-35b-a3b-vision","max_tokens":2000,"thinking":{"type":"adaptive"},"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"%s"}},{"type":"text","text":"What number is written in this image? Reply with just the number."}]}]}' \
+  "$(base64 -i /tmp/claude-local-4821.png | tr -d '\n')" > /tmp/claude-local-vision.json
+curl -sS http://127.0.0.1:8765/v1/messages -H "Authorization: Bearer local" \
+  -H "content-type: application/json" -H "anthropic-version: 2023-06-01" -d @/tmp/claude-local-vision.json \
+  | /usr/bin/jq -r '.content[] | select(.type == "text") | .text'
+```
+
+**c3. Quality model check** (if installed). Expect "391"; the first request swaps models (a few seconds):
+
+```sh
+curl -sS http://127.0.0.1:8765/v1/messages -H "Authorization: Bearer local" \
+  -H "content-type: application/json" -H "anthropic-version: 2023-06-01" \
+  -d '{"model":"qwen3.8-27b","max_tokens":4000,"thinking":{"type":"adaptive"},
+       "messages":[{"role":"user","content":"What is 17*23? Answer with just the number."}]}' \
+  | /usr/bin/jq -r '.content[] | select(.type == "text") | .text'
+```
+
 **d. Claude Code in print mode.** Expect `OK` in a few seconds:
 
 ```sh
@@ -299,15 +411,17 @@ mkdir -p /tmp/claude-local-test && cd /tmp/claude-local-test
 claude-local -p "Reply with exactly the word OK and nothing else."
 ```
 
-**e. Agentic coding test.** This took 6 turns and about 30 s on the tested Mac:
+**e. Agentic coding test.** This took 6 turns and about 30 s with the fast model on the tested Mac. To try the quality model, put `--local-quality` right after `claude-local`; it took 4 turns and about 60 s, most of it processing Claude Code's 16K-token prompt the first time.
 
 ```sh
 rm -rf /tmp/claude-local-agentic && mkdir -p /tmp/claude-local-agentic && cd /tmp/claude-local-agentic && git init -q
 claude-local -p "Create a Python module textstats.py with word_frequencies(text: str) -> dict[str, int] (lowercase, strip punctuation, count words) and top_n(text: str, n: int) -> list[tuple[str, int]] (sorted by count descending, then word ascending). Create test_textstats.py with unittest tests for an empty string, punctuation and ties. Run python3 -m unittest -v and fix failures until all pass. Finish with a one-line summary." \
   --permission-mode acceptEdits \
   --allowedTools "Read,Write,Edit,Glob,Grep,Bash(python3 -m unittest *),Bash(python3 -m unittest)"
-python3 -m unittest -v 2>&1 | tail -3      # confirm independently: OK
+python3 -m unittest -v 2>&1 | tail -3
 ```
+
+The last command re-runs the tests yourself; expect `OK`.
 
 **f. Interactive session.** First launch shows the theme picker, security notes and a folder-trust prompt, once per profile and folder:
 
@@ -320,16 +434,18 @@ The header should read `qwen3.6-35b-a3b with medium effort`. In the session:
 - Ask a question to confirm it answers.
 - `/exit`.
 
-**g. Memory acceptance test at full context.** This sends one prompt at the largest size Claude Code can send for your window, then reports the answer and the server's peak memory. Claude Code auto-compacts at the window minus about 33K and refuses to send more than the window minus about 23K (with the default 32K max output), so the test uses about 108K tokens for a 131072 window.
+**g. Memory acceptance test at full context.** This sends one prompt at the largest size Claude Code can send for a window, then reports the answer and the server's peak memory. Claude Code auto-compacts at the window minus about 33K and refuses to send more than the window minus about 23K, so the test uses about 108K tokens for the fast model's 131072 window.
+
+The block below tests the fast model without vision. `./install-claude-local.sh --memory-test` runs the same test for every installed model and vision setting, each on a freshly started server; that's the easier way. By hand, set `CTX` and the `model` value to another row from step 7. The prompt starts with a unique line, so an earlier run's cache can't make the test look faster than it is.
 
 ```sh
 CTX=131072
 OMLX_RES=~/Applications/oMLX.app/Contents/Resources/Python
 PYTHONHOME=$OMLX_RES/cpython-3.11 PYTHONPATH=$OMLX_RES/framework-mlx-base/lib/python3.11/site-packages \
   "$OMLX_RES/cpython-3.11/bin/python3" - "$CTX" > /tmp/claude-local-long.json <<'PY'
-import glob, json, os, sys, sysconfig
+import glob, json, os, sys, sysconfig, time
 target = int((int(sys.argv[1]) - 23000) * 3.8)   # Claude Code's largest prompt: window - 23K tokens, ~3.8 chars/token
-text = ""
+text = f"RUN {time.time()}\n"   # unique start, so no earlier run's cache helps
 for f in sorted(glob.glob(os.path.join(sysconfig.get_paths()["stdlib"], "*.py"))):
     text += f"\n##### FILE: {os.path.basename(f)}\n" + open(f, encoding="utf-8", errors="replace").read()
     if len(text) >= target:
@@ -348,7 +464,7 @@ time curl -sS -m 1200 "${H[@]}" http://127.0.0.1:8765/v1/messages -d @/tmp/claud
 footprint -p "$(cat ~/.omlx/claude-local-server.pid)" | grep phys_footprint
 ```
 
-- **Pass:** the answer matches the "expected answer" line and `phys_footprint_peak` stays below the GPU budget from step 7. The tested Mac took 55 s for 105.7K tokens and peaked at 27 GB.
+- **Pass:** the answer matches the "expected answer" line and `phys_footprint_peak` stays below the GPU budget from step 7. The tested Mac took 67 s for 105.7K tokens and peaked at 26 GB.
 - **Warm path:** run the `time curl` line again. It should answer in about a second from the prefix cache.
 - **Fail:** if the result is an error mentioning "Prefill context too large", lower the context window (step 7) and re-run with the new `CTX`.
 
@@ -361,46 +477,66 @@ claude auth status | diff - ~/claude-local-baseline/auth.txt && echo "login unch
 
 ## Daily use
 
-```sh
-claude-local                    # interactive; takes the same flags as claude
-claude-local -p "question"      # print mode
-claude-local --continue         # resume the last local session in this folder
-claude-local --local-status     # server, model and memory warnings
-claude-local --local-start      # warm the model before you need it
-claude-local --local-stop       # stop the server and free ~20 GB now
-claude-local --local-help
-```
+| Command | What it does |
+|---|---|
+| `claude-local` | Fast model, text only; takes the same flags as claude |
+| `claude-local --local-vision` | Fast model with image input |
+| `claude-local --local-quality` | Qwen3.8-27B, slower but stronger |
+| `claude-local --local-quality --local-vision` | Qwen3.8-27B with image input |
+| `claude-local -p "question"` | Print mode (wrapper options go first) |
+| `claude-local --continue` | Resume the last local session in this folder |
+| `claude-local --local-quality --local-set-default` | Make quality the default from now on |
+| `claude-local --local-status` | Selection, server, installed models, memory warnings |
+| `claude-local --local-start` | Load the selected model before you need it |
+| `claude-local --local-stop` | Stop the server and free the model's memory now |
+| `claude-local --local-help` | Show the wrapper's options |
+
+Wrapper options (`--local-...`) always go before Claude Code's own arguments.
+
+`CLAUDE_LOCAL_PROFILE=quality` and `CLAUDE_LOCAL_VISION=on` do the same as the options for one command or a whole shell. To go back to the built-in default, delete `~/.config/claude-local/defaults`.
 
 Expect:
-- **Speed:** about 70–90 tokens/s generation, and about 1,500–1,900 tokens/s prefill on long prompts. After the first turn most of the prompt comes from the cache (about 98% hits in testing).
+- **Fast model:** about 70–90 tokens/s generation, and about 1,500–1,900 tokens/s prefill on long prompts.
+- **Quality model:** about 20–45 tokens/s generation with its multi-token-prediction head, and about 450–550 tokens/s prefill. A new session's first reply takes about 30–40 s while it processes Claude Code's 16K-token prompt; later turns come mostly from the cache.
+- **Caching:** after the first turn, most of the prompt comes from the cache (about 98% hits in testing, for both models).
+- **Switching models:** only one model is loaded at a time. The first request after a switch loads the other model (about 5–15 s), and the other model's cached prompts are kept on disk.
 - **Memory:** for best results, close memory-heavy apps and stop VMs before long sessions.
 
-Per-invocation overrides: `CLAUDE_LOCAL_CTX`, `CLAUDE_LOCAL_MAX_OUT`, `CLAUDE_LOCAL_MODEL`, `CLAUDE_LOCAL_PORT`. For example: `CLAUDE_LOCAL_CTX=65536 CLAUDE_LOCAL_MAX_OUT=16384 claude-local`.
+Overrides for experiments: `CLAUDE_LOCAL_CTX`, `CLAUDE_LOCAL_MAX_OUT`, `CLAUDE_LOCAL_MODEL` (a served model name) and `CLAUDE_LOCAL_PORT`. For example: `CLAUDE_LOCAL_CTX=65536 CLAUDE_LOCAL_MAX_OUT=16384 claude-local`.
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| `port 8765 is in use ... does not serve 'qwen3.6-35b-a3b'` | Something else owns the port (`lsof -nP -iTCP:8765`). Stop it, or use another port: `CLAUDE_LOCAL_PORT=8766 claude-local`. |
+| `port 8765 is in use by pid N, which isn't oMLX` | Something else owns the port (`lsof -nP -iTCP:8765`). Stop it, or use another port: `CLAUDE_LOCAL_PORT=8766 claude-local`. |
 | `oMLX did not list 'qwen3.6-35b-a3b' within 90 s` or `oMLX exited during startup` | Read `~/.omlx/logs/claude-local-server.log`. The model folder name under `~/.omlx/models/` must match the key in `model_settings.json`. |
 | An API error mentioning "Prefill context too large" | The prompt didn't fit in GPU memory. Close large apps, stop VMs or other model servers, or lower the context window (step 7). |
 | The model ignores the prompt or invents a task | Make sure you are on the oMLX backend (`--local-status`). The optional Ollama backend (`CLAUDE_LOCAL_BACKEND=ollama`) misbehaved this way on Ollama 0.30.10 and needs a newer Ollama. |
-| Slow first reply in a new session | The prompt prefix is being processed cold (about 16K tokens, a few seconds). Later turns reuse the SSD prefix cache. |
+| Slow first reply in a new session | Claude Code's ~16K-token prompt is being processed cold: about 5–10 s with the fast model and 30–40 s with the quality model. Later turns reuse the SSD prefix cache. |
+| `the quality model is not installed` | Run `./install-claude-local.sh --with-quality`. |
+| The model says it can't see an image | Vision is off: relaunch with `--local-vision`. With vision off, image reads are refused and pasted images are dropped. |
+| The vision model misreads small text | Small images get few image tokens: a 480×200 image lost a digit that 640×400 kept. Use full-size screenshots rather than tiny crops. |
+| `oMLX is running but doesn't list '<model>'` | The server started before that model or its settings were installed. Run `claude-local --local-stop` (or re-run the installer with `--restart-server`); the next launch rescans the models. |
+| Warning that a model "was used Ns ago, probably by another session" | Another `claude-local` window is using a different model. This launch swaps it out, and that window's next request swaps it back, each costing a reload. Use the same model in both, or accept the reloads. |
 | Everything is slow, or the Mac is swapping | Another large memory user is running: OrbStack or Docker VMs, Ollama or LM Studio with a model loaded. `claude-local` warns about these at launch. |
 | Claude Code updated and `claude-local` broke | Normal `claude` is unaffected. Run `claude-local -p "Reply OK"` and read the error. Check the environment variables in the wrapper against the new release's docs. |
 
 ## Updating
 
 - **oMLX:** repeat step 2 with a new `OMLX_TAG`. Stop the server first with `claude-local --local-stop`. The config in `~/.omlx` is kept. Re-run steps 8b–8g.
-- **Model:** download into a new folder under `~/.omlx/models/` and add an entry for it to `model_settings.json` with its own alias (not starting with `claude-`). Run it with `CLAUDE_LOCAL_MODEL=<alias> claude-local`. Re-run step 8g, because memory use changes with the model.
+- **Models:** to try another model, download it into a new folder under `~/.omlx/models/` and add an entry to `model_settings.json` with its own alias (not starting with `claude-`). Run it with `CLAUDE_LOCAL_MODEL=<alias> CLAUDE_LOCAL_CTX=<window> claude-local`, and measure its window first (step 8g); memory use changes with every model.
+  - Making it a named choice like `--local-quality` takes several edits to `src/claude-local`: a row in `profile_row`, the option parsing, the `CLAUDE_LOCAL_PROFILE` and defaults checks, and the status loop.
+  - Then run `python3 scripts/build.py`.
 - **Claude Code:** it updates itself as usual. After a major update, re-run steps 8d and 8e.
 
 ## Uninstall
 
 ```sh
 claude-local --local-stop
-rm ~/.local/bin/claude-local ~/.local/bin/claude-local.bak-* 2>/dev/null
+rm -f ~/.local/bin/claude-local
+find ~/.local/bin -name 'claude-local.bak-*' -delete
 rm -rf ~/.claude-local ~/.omlx ~/Applications/oMLX.app ~/Downloads/omlx ~/claude-local-baseline
+rm -rf "${XDG_CONFIG_HOME:-$HOME/.config}/claude-local"
 ```
 
 If oMLX was already set up on the Mac before `claude-local`, don't delete `~/.omlx`. Remove the model folder you don't want, then restore the originals from `~/.omlx/*.pre-claude-local`.
@@ -408,7 +544,8 @@ If oMLX was already set up on the Mac before `claude-local`, don't delete `~/.om
 ## Design notes
 
 - **Why this model:** Qwen3.6-35B-A3B is a mixture-of-experts model with 3B active parameters, so it runs at about 80+ tokens/s on a 32-core M5 Max. Only 10 of its 40 layers keep a normal attention cache (about 20 KiB per token), so long contexts are cheap.
-- **A newer option:** Qwen3.8-27B (August 2026) scores higher on vendor benchmarks but runs 3–5× slower on this class of GPU. Its chat template also rejects some Claude Code messages, so it is a possible future "quality" option, not the default.
+- **The quality model:** Qwen3.8-27B (August 2026) is a dense 27B model. Its vendor benchmarks are well ahead of Qwen3.6-35B-A3B (SWE-bench Pro 61.7 against 49.5), but nobody has reproduced them independently, and they were run at full precision with a 256K context. Here it's a 4-bit build at up to a 92K window, and it generates about 2–4× slower and processes prompts about 3–4× slower. On the one coding test run here, both models passed. The build is `oQ4e-mtp` from oMLX's author, one of the few 4-bit MLX builds that keep the model's multi-token-prediction head.
+- **Vision:** both models accept images. oMLX's text engine silently drops images, and its vision engine costs 1.1–2.3 GB more memory. A symlinked second folder is the way to give the same weights two engine settings, because oMLX ties the engine choice to the model's folder.
 - **Why the Unsloth build:** its dynamic 4-bit quantization measures about 3× closer to the full-precision model than uniform 4-bit (KL divergence 0.029 vs 0.088), for about 1 GB more. 5-bit and larger don't leave room for context on a 36 GB Mac.
 - **Why oMLX:** it serves the Anthropic Messages API natively. It removes Claude Code's cache-breaking per-request markers, accepts mid-conversation system messages and adaptive thinking, and has a paged prefix cache on SSD. Version 0.7.0rc1 or later is needed for the bounded long-prompt attention path and the partial-block cache reuse for this model family.
 - **Why not 32K context:** Claude Code auto-compacts at the window minus about 33K, which a 32K window is already below.
