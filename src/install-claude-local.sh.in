@@ -1,10 +1,11 @@
 #!/bin/bash
-# install-claude-local.sh: install claude-local (Claude Code on a local open-weight model).
+# install-claude-local.sh: install claude-local (Claude Code on a local open-weight model)
+# and claude-remote (the same, with the model served by another Mac).
 # Automates INSTALL.md. No admin rights needed, and it never uses sudo. It is safe to
 # re-run: finished steps are skipped, and existing configs are merged rather than replaced.
 #
 # Usage: ./install-claude-local.sh [--with-quality] [--with-laguna] [--with-all] [--no-verify]
-#                                  [--memory-test] [--restart-server] [--force] [--help]
+#                                  [--memory-test] [--restart-server] [--force] [--client-only] [--help]
 #   --with-quality  also install the quality model, Qwen3.8-27B (17-24 GB)
 #   --with-laguna   also install Laguna: XS 2.1 on 36 GB Macs (20 GB), S 2.1 on 96 GB
 #                   and up (64 GB); installed anyway on 96 GB and up, where it is the default
@@ -16,6 +17,9 @@
 #   --restart-server  restart the server (to load new models or settings) and run
 #                   the memory test even if another session seems to be using it
 #   --force         continue on a Mac with less than 16 GB of memory
+#   --client-only   install only the wrappers and the Claude Code profile, for a
+#                   Mac that uses models on another Mac with claude-remote (no
+#                   oMLX, no model downloads)
 # CLAUDE_LOCAL_PORT=<port> uses another port than 8765 (for testing, with another HOME).
 # The models depend on the Mac's memory; claude-local --local-status lists them.
 # Models already installed are kept up to date on re-runs.
@@ -31,6 +35,7 @@ OMLX_PY_ROOT="$APP/Contents/Resources/Python"
 OMLX_HOME="$HOME/.omlx"
 PROFILE="$HOME/.claude-local"
 WRAPPER="$HOME/.local/bin/claude-local"
+REMOTE_WRAPPER="$HOME/.local/bin/claude-remote"
 BASELINE="$HOME/claude-local-baseline"
 DL_DIR="$HOME/Downloads/omlx"
 WINDOWS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-local/windows"
@@ -51,6 +56,7 @@ force=0
 restart_server=0
 with_quality=0
 with_laguna=0
+client_only=0
 for arg in "$@"; do
   case "$arg" in
     --with-quality) with_quality=1 ;;
@@ -60,6 +66,7 @@ for arg in "$@"; do
     --memory-test) memory_test=1 ;;
     --force) force=1 ;;
     --restart-server) restart_server=1 ;;
+    --client-only) client_only=1 ;;
     -h|--help) awk 'NR > 1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
     *) echo "unknown option: $arg (see --help)" >&2; exit 2 ;;
   esac
@@ -96,12 +103,17 @@ installed() { [ -f "$OMLX_HOME/models/$1/config.json" ]; }
 # The claude-local wrapper this script installs. It also knows which models
 # fit this Mac (claude-local --local-catalog), so write it out first.
 NEW_WRAPPER=$(mktemp)
-trap 'rm -f "$NEW_WRAPPER"' EXIT
+NEW_REMOTE=$(mktemp)
+trap 'rm -f "$NEW_WRAPPER" "$NEW_REMOTE"' EXIT
 cat > "$NEW_WRAPPER" <<'CLAUDE_LOCAL_SCRIPT'
 @@WRAPPER@@
 CLAUDE_LOCAL_SCRIPT
-chmod 755 "$NEW_WRAPPER"
+cat > "$NEW_REMOTE" <<'CLAUDE_REMOTE_SCRIPT'
+@@REMOTE_WRAPPER@@
+CLAUDE_REMOTE_SCRIPT
+chmod 755 "$NEW_WRAPPER" "$NEW_REMOTE"
 bash -n "$NEW_WRAPPER" || die "internal error: the embedded wrapper has a syntax error"
+bash -n "$NEW_REMOTE" || die "internal error: the embedded claude-remote has a syntax error"
 CATALOG=$("$NEW_WRAPPER" --local-catalog) || die "internal error: the embedded wrapper has no catalog"
 
 # cat_field <profile> <field>: this Mac's catalog entry for a role ('-' = none).
@@ -152,6 +164,115 @@ clear_window() {  # clear_window <alias>
   mv "$tmp" "$WINDOWS_FILE"
 }
 
+# The Claude Code profile for local and remote sessions (INSTALL.md step 5).
+setup_profile() {
+  mkdir -p "$PROFILE"
+  if [ -e "$HOME/.claude/CLAUDE.md" ] && [ ! -e "$PROFILE/CLAUDE.md" ]; then
+    ln -s "$HOME/.claude/CLAUDE.md" "$PROFILE/CLAUDE.md"
+    info "linked ~/.claude-local/CLAUDE.md -> ~/.claude/CLAUDE.md"
+  fi
+  if [ -e "$PROFILE/settings.json" ]; then
+    info "~/.claude-local/settings.json already exists; leaving it alone"
+  else
+    { [ -f "$HOME/.claude/settings.json" ] && cat "$HOME/.claude/settings.json" || echo '{}'; } \
+      | "$JQ" '{cleanupPeriodDays, theme, hooks} | with_entries(select(.value != null))
+          + {effortLevel: "medium", useAutoModeDuringPlan: false, disableClaudeAiConnectors: true,
+             permissions: {defaultMode: "default"}}' > "$PROFILE/settings.json"
+    info "wrote ~/.claude-local/settings.json (theme and hooks copied from ~/.claude/settings.json)"
+  fi
+}
+
+# install_script <new> <dest>: install a wrapper, backing up a different one.
+install_script() {
+  local new="$1" dest="$2" backup
+  mkdir -p "$(dirname "$dest")"
+  if [ -f "$dest" ] && cmp -s "$new" "$dest"; then
+    info "$dest is up to date"
+  else
+    if [ -f "$dest" ]; then
+      backup="$dest.bak-$(date +%Y%m%d-%H%M%S)"
+      cp -p "$dest" "$backup"
+      info "backed up the previous $(basename "$dest") to $backup"
+    fi
+    cp "$new" "$dest.new"
+    mv "$dest.new" "$dest"
+    info "installed $dest"
+  fi
+  chmod 755 "$dest"
+}
+
+# Normal Claude Code must be exactly as the baseline recorded it.
+check_normal_claude() {
+  if [ "$(settings_sha)" = "$(cat "$BASELINE/sha.txt")" ]; then
+    pass "normal Claude Code settings unchanged"
+  else
+    fail "normal Claude Code settings differ from the baseline in $BASELINE"
+  fi
+  # Compare only who is logged in and how; other status fields can vary.
+  login_fields() {  # the JSON fields, or the raw text if it isn't JSON
+    local raw
+    raw=$(cat)
+    printf '%s' "$raw" | "$JQ" -S '{loggedIn, authMethod, email, orgId}' 2>/dev/null || printf '%s\n' "$raw"
+  }
+  if [ "$("$CLAUDE_BIN" auth status 2>/dev/null | login_fields)" = "$(login_fields < "$BASELINE/auth.txt")" ]; then
+    pass "normal Claude Code login unchanged"
+  else
+    fail "normal Claude Code login differs from the baseline in $BASELINE"
+  fi
+}
+
+record_baseline() {
+  if [ -f "$BASELINE/sha.txt" ]; then
+    info "baseline of normal Claude Code already in $BASELINE"
+  else
+    mkdir -p "$BASELINE"
+    settings_sha > "$BASELINE/sha.txt"
+    "$CLAUDE_BIN" auth status > "$BASELINE/auth.txt" 2>/dev/null || true
+    info "recorded a baseline of normal Claude Code in $BASELINE"
+  fi
+}
+
+find_claude() {
+  CLAUDE_BIN="$HOME/.local/bin/claude"
+  [ -x "$CLAUDE_BIN" ] || CLAUDE_BIN="$(command -v claude || true)"
+  [ -n "$CLAUDE_BIN" ] || die "Claude Code not found. Install it first (https://code.claude.com/docs) and log in."
+  info "Claude Code: $CLAUDE_BIN ($("$CLAUDE_BIN" --version 2>/dev/null | head -1))"
+}
+
+check_path() {
+  case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *) warn "~/.local/bin is not on your PATH; add it to run claude-local and claude-remote by name." ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Client only: the wrappers and the profile, for models on another Mac.
+if [ "$client_only" -eq 1 ]; then
+  step "1/3 Checking this Mac (client only: no oMLX or models)"
+  info "$(sysctl -n machdep.cpu.brand_string), macOS $(sw_vers -productVersion)"
+  [ -x "$JQ" ] || die "/usr/bin/jq not found (it ships with macOS 15 and later)."
+  find_claude
+  check_path
+  record_baseline
+  step "2/3 Creating the isolated Claude Code profile ~/.claude-local (INSTALL.md step 5)"
+  setup_profile
+  step "3/3 Installing the claude-local and claude-remote wrappers"
+  install_script "$NEW_WRAPPER" "$WRAPPER"
+  install_script "$NEW_REMOTE" "$REMOTE_WRAPPER"
+  problems=0
+  pass() { info "PASS $*"; }
+  fail() { warn "FAIL $*"; problems=$((problems + 1)); }
+  check_normal_claude
+  echo
+  echo "Installed. Next, point claude-remote at a Mac that runs the full install:"
+  echo "  claude-remote --remote-host=NAME --remote-set-default   NAME: an ssh alias, hostname or user@host"
+  echo "  claude-remote --remote-status                          check the host and its models"
+  echo "  claude-remote                                          a session with the host's default model"
+  [ "$problems" -eq 0 ]
+  exit
+fi
+
 # ---------------------------------------------------------------------------
 step "1/8 Checking this Mac"
 [ "$(uname -m)" = "arm64" ] || die "Apple Silicon is required."
@@ -171,10 +292,7 @@ for p in fast quality laguna; do
 done
 [ -x "$JQ" ] || die "/usr/bin/jq not found (it ships with macOS 15 and later)."
 
-CLAUDE_BIN="$HOME/.local/bin/claude"
-[ -x "$CLAUDE_BIN" ] || CLAUDE_BIN="$(command -v claude || true)"
-[ -n "$CLAUDE_BIN" ] || die "Claude Code not found. Install it first (https://code.claude.com/docs) and log in."
-info "Claude Code: $CLAUDE_BIN ($("$CLAUDE_BIN" --version 2>/dev/null | head -1))"
+find_claude
 
 # Disk: each model still to download, plus room for oMLX and some slack. The
 # SSD prompt cache grows later, up to its cap (step 5).
@@ -204,19 +322,8 @@ if [ -n "$pid" ]; then
 else
   info "port $PORT: free"
 fi
-case ":$PATH:" in
-  *":$HOME/.local/bin:"*) ;;
-  *) warn "~/.local/bin is not on your PATH; add it to run claude-local by name." ;;
-esac
-
-if [ -f "$BASELINE/sha.txt" ]; then
-  info "baseline of normal Claude Code already in $BASELINE"
-else
-  mkdir -p "$BASELINE"
-  settings_sha > "$BASELINE/sha.txt"
-  "$CLAUDE_BIN" auth status > "$BASELINE/auth.txt" 2>/dev/null || true
-  info "recorded a baseline of normal Claude Code in $BASELINE"
-fi
+check_path
+record_baseline
 
 # ---------------------------------------------------------------------------
 step "2/8 Installing oMLX $OMLX_TAG into ~/Applications (INSTALL.md step 2)"
@@ -243,7 +350,7 @@ else
 
   mnt=$(mktemp -d)
   hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$dmg" >/dev/null 2>&1 || die "Could not mount $dmg."
-  trap 'hdiutil detach "$mnt" >/dev/null 2>&1 || true; rm -f "$NEW_WRAPPER"' EXIT
+  trap 'hdiutil detach "$mnt" >/dev/null 2>&1 || true; rm -f "$NEW_WRAPPER" "$NEW_REMOTE"' EXIT
   codesign --verify --deep --strict "$mnt/oMLX.app" 2>/dev/null || die "oMLX.app failed its code-signature check."
   spctl -a -t exec "$mnt/oMLX.app" 2>/dev/null || die "Gatekeeper did not accept oMLX.app (not notarized?)."
   info "signed and notarized: $(codesign -dv --verbose=2 "$mnt/oMLX.app" 2>&1 | sed -n 's/^Authority=\(Developer ID Application.*\)/\1/p')"
@@ -256,7 +363,7 @@ else
   rm -rf "$APP"
   mv "$APP.new" "$APP"
   hdiutil detach "$mnt" >/dev/null 2>&1 || true
-  trap 'rm -f "$NEW_WRAPPER"' EXIT
+  trap 'rm -f "$NEW_WRAPPER" "$NEW_REMOTE"' EXIT
   info "installed oMLX $("$OMLX_CLI" --version) at $APP"
   info "(don't open it from Finder; claude-local runs its server headless)"
 fi
@@ -448,37 +555,12 @@ fi
 
 # ---------------------------------------------------------------------------
 step "6/8 Creating the isolated Claude Code profile ~/.claude-local (INSTALL.md step 5)"
-mkdir -p "$PROFILE"
-if [ -e "$HOME/.claude/CLAUDE.md" ] && [ ! -e "$PROFILE/CLAUDE.md" ]; then
-  ln -s "$HOME/.claude/CLAUDE.md" "$PROFILE/CLAUDE.md"
-  info "linked ~/.claude-local/CLAUDE.md -> ~/.claude/CLAUDE.md"
-fi
-if [ -e "$PROFILE/settings.json" ]; then
-  info "~/.claude-local/settings.json already exists; leaving it alone"
-else
-  { [ -f "$HOME/.claude/settings.json" ] && cat "$HOME/.claude/settings.json" || echo '{}'; } \
-    | "$JQ" '{cleanupPeriodDays, theme, hooks} | with_entries(select(.value != null))
-        + {effortLevel: "medium", useAutoModeDuringPlan: false, disableClaudeAiConnectors: true,
-           permissions: {defaultMode: "default"}}' > "$PROFILE/settings.json"
-  info "wrote ~/.claude-local/settings.json (theme and hooks copied from ~/.claude/settings.json)"
-fi
+setup_profile
 
 # ---------------------------------------------------------------------------
-step "7/8 Installing the claude-local wrapper (INSTALL.md step 6)"
-mkdir -p "$(dirname "$WRAPPER")"
-if [ -f "$WRAPPER" ] && cmp -s "$NEW_WRAPPER" "$WRAPPER"; then
-  info "$WRAPPER is up to date"
-else
-  if [ -f "$WRAPPER" ]; then
-    backup="$WRAPPER.bak-$(date +%Y%m%d-%H%M%S)"
-    cp -p "$WRAPPER" "$backup"
-    info "backed up the previous wrapper to $backup"
-  fi
-  cp "$NEW_WRAPPER" "$WRAPPER.new"
-  mv "$WRAPPER.new" "$WRAPPER"
-  info "installed $WRAPPER"
-fi
-chmod 755 "$WRAPPER"
+step "7/8 Installing the claude-local and claude-remote wrappers (INSTALL.md step 6)"
+install_script "$NEW_WRAPPER" "$WRAPPER"
+install_script "$NEW_REMOTE" "$REMOTE_WRAPPER"
 
 # ---------------------------------------------------------------------------
 if [ "$verify" -eq 0 ]; then
@@ -696,22 +778,7 @@ fi
 "$WRAPPER" --local-start >/dev/null 2>&1 \
   || warn "couldn't load the default model; the next claude-local launch will start it"
 
-if [ "$(settings_sha)" = "$(cat "$BASELINE/sha.txt")" ]; then
-  pass "normal Claude Code settings unchanged"
-else
-  fail "normal Claude Code settings differ from the baseline in $BASELINE"
-fi
-# Compare only who is logged in and how; other status fields can vary.
-login_fields() {  # the JSON fields, or the raw text if it isn't JSON
-  local raw
-  raw=$(cat)
-  printf '%s' "$raw" | "$JQ" -S '{loggedIn, authMethod, email, orgId}' 2>/dev/null || printf '%s\n' "$raw"
-}
-if [ "$("$CLAUDE_BIN" auth status 2>/dev/null | login_fields)" = "$(login_fields < "$BASELINE/auth.txt")" ]; then
-  pass "normal Claude Code login unchanged"
-else
-  fail "normal Claude Code login differs from the baseline in $BASELINE"
-fi
+check_normal_claude
 
 echo
 if [ "$problems" -eq 0 ]; then
@@ -729,5 +796,6 @@ for p in fast quality laguna; do
 done
 echo "  claude-local --local-status         this Mac's models, windows, server and memory warnings"
 echo "  claude-local --local-stop           stop the server and free the model's memory"
+echo "  claude-remote --remote-help         use a model on another Mac instead (see INSTALL.md)"
 [ "$class" != 16 ] && echo "In a session, /context should show about 16K tokens used."
 [ "$problems" -eq 0 ]

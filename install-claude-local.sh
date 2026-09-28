@@ -1,10 +1,11 @@
 #!/bin/bash
-# install-claude-local.sh: install claude-local (Claude Code on a local open-weight model).
+# install-claude-local.sh: install claude-local (Claude Code on a local open-weight model)
+# and claude-remote (the same, with the model served by another Mac).
 # Automates INSTALL.md. No admin rights needed, and it never uses sudo. It is safe to
 # re-run: finished steps are skipped, and existing configs are merged rather than replaced.
 #
 # Usage: ./install-claude-local.sh [--with-quality] [--with-laguna] [--with-all] [--no-verify]
-#                                  [--memory-test] [--restart-server] [--force] [--help]
+#                                  [--memory-test] [--restart-server] [--force] [--client-only] [--help]
 #   --with-quality  also install the quality model, Qwen3.8-27B (17-24 GB)
 #   --with-laguna   also install Laguna: XS 2.1 on 36 GB Macs (20 GB), S 2.1 on 96 GB
 #                   and up (64 GB); installed anyway on 96 GB and up, where it is the default
@@ -16,6 +17,9 @@
 #   --restart-server  restart the server (to load new models or settings) and run
 #                   the memory test even if another session seems to be using it
 #   --force         continue on a Mac with less than 16 GB of memory
+#   --client-only   install only the wrappers and the Claude Code profile, for a
+#                   Mac that uses models on another Mac with claude-remote (no
+#                   oMLX, no model downloads)
 # CLAUDE_LOCAL_PORT=<port> uses another port than 8765 (for testing, with another HOME).
 # The models depend on the Mac's memory; claude-local --local-status lists them.
 # Models already installed are kept up to date on re-runs.
@@ -31,6 +35,7 @@ OMLX_PY_ROOT="$APP/Contents/Resources/Python"
 OMLX_HOME="$HOME/.omlx"
 PROFILE="$HOME/.claude-local"
 WRAPPER="$HOME/.local/bin/claude-local"
+REMOTE_WRAPPER="$HOME/.local/bin/claude-remote"
 BASELINE="$HOME/claude-local-baseline"
 DL_DIR="$HOME/Downloads/omlx"
 WINDOWS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-local/windows"
@@ -51,6 +56,7 @@ force=0
 restart_server=0
 with_quality=0
 with_laguna=0
+client_only=0
 for arg in "$@"; do
   case "$arg" in
     --with-quality) with_quality=1 ;;
@@ -60,6 +66,7 @@ for arg in "$@"; do
     --memory-test) memory_test=1 ;;
     --force) force=1 ;;
     --restart-server) restart_server=1 ;;
+    --client-only) client_only=1 ;;
     -h|--help) awk 'NR > 1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
     *) echo "unknown option: $arg (see --help)" >&2; exit 2 ;;
   esac
@@ -96,7 +103,8 @@ installed() { [ -f "$OMLX_HOME/models/$1/config.json" ]; }
 # The claude-local wrapper this script installs. It also knows which models
 # fit this Mac (claude-local --local-catalog), so write it out first.
 NEW_WRAPPER=$(mktemp)
-trap 'rm -f "$NEW_WRAPPER"' EXIT
+NEW_REMOTE=$(mktemp)
+trap 'rm -f "$NEW_WRAPPER" "$NEW_REMOTE"' EXIT
 cat > "$NEW_WRAPPER" <<'CLAUDE_LOCAL_SCRIPT'
 #!/bin/bash
 # claude-local: run Claude Code against a local open-weight model.
@@ -126,7 +134,8 @@ cat > "$NEW_WRAPPER" <<'CLAUDE_LOCAL_SCRIPT'
 #   --local-start         start the server and load the selected model, then exit
 #   --local-stop          stop the oMLX server started by claude-local
 #   --local-help          show this help
-# The default model is fast, or laguna on Macs with 96 GB or more.
+# The default model is fast, or laguna on Macs with 96 GB or more. To use a
+# model served by another Mac, see claude-remote.
 #
 # Environment, per invocation: CLAUDE_LOCAL_PROFILE=fast|quality|laguna and
 # CLAUDE_LOCAL_VISION=on|off. For experiments: CLAUDE_LOCAL_MODEL (served model
@@ -148,7 +157,6 @@ die() { echo "claude-local: $*" >&2; exit 1; }
 # Native installer symlink (follows updates); fall back to whatever claude is on PATH.
 CLAUDE_BIN="$HOME/.local/bin/claude"
 [ -x "$CLAUDE_BIN" ] || CLAUDE_BIN="$(command -v claude || true)"
-[ -n "$CLAUDE_BIN" ] || die "Claude Code not found (expected ~/.local/bin/claude)"
 
 # oMLX.app in ~/Applications (no admin needed), else /Applications.
 OMLX_APP="$HOME/Applications/oMLX.app"
@@ -159,6 +167,110 @@ OMLX_LOG="$OMLX_HOME/logs/claude-local-server.log"
 LOCAL_CONFIG_DIR="$HOME/.claude-local"
 DEFAULTS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-local/defaults"
 WINDOWS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-local/windows"
+# How to relaunch, for messages: claude-local, or claude-remote in remote mode.
+me=claude-local
+px=--local-
+where="this Mac"
+
+# Claude Code subcommands (mcp, doctor, update, ...) take no session flags
+# and need no model.
+is_subcommand() {
+  case "${1:-}" in
+    agents|attach|auth|auto-mode|doctor|gateway|import|install|logs|mcp|plugin|plugins|project|respawn|rm|setup-token|stop|kill|ultrareview|update|upgrade) return 0 ;;
+  esac
+  return 1
+}
+
+# True when the backend answers and lists $model.
+server_has_model() {
+  curl -fsS -m 3 -H "Authorization: Bearer $token" "$base_url/v1/models" 2>/dev/null \
+    | /usr/bin/jq -e --arg m "$model" 'any(.data[]?; .id == $m)' >/dev/null 2>&1
+}
+
+# Launch Claude Code against the chosen model; used by both local and remote
+# sessions. Needs: model, base_url, token, ctx, max_out, caps, lean, vision,
+# has_vision, fast_vision, me and px.
+launch_claude() {
+  [ -n "$CLAUDE_BIN" ] || die "Claude Code not found (expected ~/.local/bin/claude)"
+  [ -d "$LOCAL_CONFIG_DIR" ] || mkdir -p "$LOCAL_CONFIG_DIR"
+
+  # Drop anything that could route or authenticate elsewhere.
+  unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_PROFILE ANTHROPIC_BETAS \
+    ANTHROPIC_SMALL_FAST_MODEL CLAUDE_CODE_SIMPLE CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX \
+    CLAUDE_CODE_USE_FOUNDRY CLAUDE_CODE_USE_MANTLE CLAUDE_CODE_USE_GATEWAY \
+    CLAUDE_CODE_USE_ANTHROPIC_AWS CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD \
+    CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT \
+    CLAUDE_CODE_AUTO_COMPACT_WINDOW CLAUDE_SECURESTORAGE_CONFIG_DIR CLAUDE_CODE_MODEL_CAPABILITIES
+
+  # Isolated profile and local endpoint.
+  export CLAUDE_CONFIG_DIR="$LOCAL_CONFIG_DIR"
+  export ANTHROPIC_BASE_URL="$base_url"
+  export ANTHROPIC_AUTH_TOKEN="$token"
+
+  # Every model tier maps to the one loaded model.
+  export ANTHROPIC_MODEL="$model" CLAUDE_CODE_SUBAGENT_MODEL="$model"
+  export ANTHROPIC_DEFAULT_FABLE_MODEL="$model" ANTHROPIC_DEFAULT_OPUS_MODEL="$model"
+  export ANTHROPIC_DEFAULT_SONNET_MODEL="$model" ANTHROPIC_DEFAULT_HAIKU_MODEL="$model"
+
+  # Context: Claude Code assumes 200K for unknown models; declare the real window.
+  export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$ctx" CLAUDE_CODE_MAX_OUTPUT_TOKENS="$max_out"
+
+  # Keep the prompt prefix stable so the server's prefix cache hits.
+  export CLAUDE_CODE_ATTRIBUTION_HEADER=0 CLAUDE_CODE_TOTAL_TOKENS_REMINDER=off
+
+  # Most of these models' chat templates reject system messages after the first
+  # one, and oMLX then moves them to the front, which breaks the prefix cache.
+  [ -z "$caps" ] || export CLAUDE_CODE_MODEL_CAPABILITIES="$caps"
+
+  # Compatibility with a non-Anthropic backend.
+  export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1 ENABLE_CLAUDEAI_MCP_SERVERS=false
+  export CLAUDE_CODE_DISABLE_FAST_MODE=1 CLAUDE_CODE_AUTO_MODE_SERVER=0
+  export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+
+  # One server slot: no background side requests or parallel subagents.
+  export CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=1 CLAUDE_CODE_ENABLE_AWAY_SUMMARY=0
+  export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false
+  export CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1
+
+  # Local prefill of long prompts can take minutes.
+  export API_TIMEOUT_MS=3000000 CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS=1800000
+  export CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS=600000
+
+  is_subcommand "${1:-}" && exec "$CLAUDE_BIN" "$@"
+
+  # Lean: a smaller tool set cuts Claude Code's prompt from ~16K to ~4.5K
+  # tokens, which a slow Mac needs minutes to process on every cache miss.
+  if [ "$lean" = "on" ]; then
+    set -- --tools=Read,Edit,Write,Bash,Grep,Glob --disable-slash-commands "$@"
+  fi
+
+  # Without vision the server drops images silently. A hook on the Read tool
+  # refuses image files with a clear message instead. (Deny rules would also
+  # hide image files from Glob and Grep.) The reason must not contain a quote.
+  if [ "$vision" = "off" ]; then
+    if [ "$has_vision" = "yes" ]; then
+      how="Tell the user to relaunch with $me ${px}vision."
+    elif [ "$fast_vision" = "yes" ]; then
+      how="This model has no image input; tell the user to relaunch with $me ${px}fast ${px}vision."
+    else
+      how="No model on $where has image input."
+    fi
+    reason="Image input is off in this $me session, so image files cannot be viewed. There is no workaround: do not try to decode, OCR or convert images with shell commands or scripts. $how"
+    deny=$(/usr/bin/jq -cn --arg r "$reason" \
+      '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $r}}')
+    image_hook="/usr/bin/jq -r '.tool_input.file_path // empty' | /usr/bin/grep -qiE '[.](png|jpe?g|gif|webp)\$' || exit 0
+printf '%s\n' '$deny'"
+    hook_settings=$(/usr/bin/jq -cn --arg c "$image_hook" \
+      '{hooks: {PreToolUse: [{matcher: "Read", hooks: [{type: "command", command: $c}]}]}}')
+    set -- "--settings=$hook_settings" "$@"
+  fi
+
+  # WebSearch is an Anthropic server-side tool; LSP schema changes break the
+  # prefix cache.
+  exec "$CLAUDE_BIN" --strict-mcp-config --exclude-dynamic-system-prompt-sections \
+    --disallowedTools=WebSearch,LSP "$@"
+}
+
 
 # --- Wrapper options: a leading run of --local-* arguments ------------------
 opt_profile=""
@@ -171,9 +283,10 @@ while [ $# -gt 0 ]; do
     --local-laguna) opt_profile=laguna ;;
     --local-vision) opt_vision=on ;;
     --local-no-vision) opt_vision=off ;;
-    --local-status|--local-start|--local-stop|--local-help|--local-set-default|--local-catalog)
+    --local-status|--local-start|--local-stop|--local-help|--local-set-default|--local-catalog|--local-resolve)
       [ -z "$cmd" ] || die "one of --local-status/start/stop/help/set-default at a time"
       cmd="${1#--local-}" ;;
+    --local-subcommand) cmd=subcommand; shift; break ;;
     --local-*) echo "claude-local: unknown option '$1' (see claude-local --local-help)" >&2; exit 2 ;;
     *) break ;;
   esac
@@ -183,6 +296,48 @@ done
 if [ "$cmd" = "help" ]; then
   awk 'NR > 1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0"
   exit 0
+fi
+
+# For claude-remote: is this argument a Claude Code subcommand?
+if [ "$cmd" = "subcommand" ]; then
+  if is_subcommand "${1:-}"; then exit 0; else exit 1; fi
+fi
+
+# --- Remote mode: started by claude-remote, model served by another Mac ------
+# claude-remote has opened an SSH tunnel to the host and asked the host's own
+# claude-local which model and window to use (--local-resolve). Nothing here
+# looks at this Mac's models or starts a local server.
+if [ -n "${CLAUDE_LOCAL_REMOTE:-}" ]; then
+  me=claude-remote
+  px=--remote-
+  where=$CLAUDE_LOCAL_REMOTE
+  [ -z "$cmd" ] || die "--local-$cmd doesn't apply to claude-remote sessions; see claude-remote --remote-help"
+  host=$CLAUDE_LOCAL_REMOTE
+  port=${CLAUDE_LOCAL_REMOTE_PORT:-}
+  model=${CLAUDE_LOCAL_REMOTE_MODEL:-}
+  profile=${CLAUDE_LOCAL_REMOTE_PROFILE:-}
+  vision=${CLAUDE_LOCAL_REMOTE_VISION:-off}
+  ctx=${CLAUDE_LOCAL_CTX:-${CLAUDE_LOCAL_REMOTE_CTX:-}}
+  max_out=${CLAUDE_LOCAL_MAX_OUT:-${CLAUDE_LOCAL_REMOTE_MAX_OUT:-}}
+  caps=${CLAUDE_LOCAL_REMOTE_CAPS-}
+  has_vision=${CLAUDE_LOCAL_REMOTE_HAS_VISION:-no}
+  fast_vision=${CLAUDE_LOCAL_REMOTE_FAST_VISION:-no}
+  case "${CLAUDE_LOCAL_LEAN:-${CLAUDE_LOCAL_REMOTE_LEAN:-off}}" in
+    on|1|yes|true) lean=on ;;
+    *) lean=off ;;
+  esac
+  for v in "$port" "$ctx" "$max_out"; do
+    case "$v" in ""|*[!0-9]*) die "internal error: claude-remote passed a bad port, window or output cap" ;; esac
+  done
+  case "$model" in ""|*[!A-Za-z0-9._-]*) die "internal error: claude-remote passed a bad model name" ;; esac
+  token="local"
+  base_url="http://127.0.0.1:$port"
+  if ! is_subcommand "${1:-}"; then
+    server_has_model \
+      || die "the model server on $host isn't answering through the tunnel (127.0.0.1:$port); try claude-remote --remote-status"
+    [ -t 2 ] && echo "claude-remote: $profile, vision $vision -> $model on $host, context $ctx" >&2
+  fi
+  launch_claude "$@"
 fi
 
 # --- This Mac's memory class ------------------------------------------------
@@ -388,6 +543,8 @@ if [ "$cmd" = "set-default" ]; then
   exit 0
 fi
 
+catalog fast
+if [ -n "$vision_ctx" ]; then fast_vision=yes; else fast_vision=no; fi
 profile_row "$profile" "$vision"
 # A model without image input: an explicit --local-vision is an error; a
 # saved or environment vision=on is set aside for this model.
@@ -433,12 +590,6 @@ if [ "$port" = "8765" ]; then OMLX_PIDFILE="$OMLX_HOME/claude-local-server.pid"
 else OMLX_PIDFILE="$OMLX_HOME/claude-local-server-$port.pid"; fi
 
 # --- Server helpers ----------------------------------------------------------
-# True when the backend answers and lists $model.
-server_has_model() {
-  curl -fsS -m 3 -H "Authorization: Bearer $token" "$base_url/v1/models" 2>/dev/null \
-    | /usr/bin/jq -e --arg m "$model" 'any(.data[]?; .id == $m)' >/dev/null 2>&1
-}
-
 port_listener_pid() {
   lsof -nP -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null | head -1 || true
 }
@@ -500,15 +651,6 @@ swap_warning() {
 $(loaded_models)
 EOF
   return 0
-}
-
-# Claude Code subcommands (mcp, doctor, update, ...) take no session flags
-# and need no model.
-is_subcommand() {
-  case "${1:-}" in
-    agents|attach|auth|auto-mode|doctor|gateway|import|install|logs|mcp|plugin|plugins|project|respawn|rm|setup-token|stop|kill|ultrareview|update|upgrade) return 0 ;;
-  esac
-  return 1
 }
 
 start_omlx() {
@@ -654,9 +796,25 @@ case "$cmd" in
     memory_warnings
     ensure_server
     swap_warning
-    echo "claude-local: loading '$model'..." >&2
-    warm_model || die "the model failed to load; see $OMLX_LOG"
+    # Don't queue a warm-up behind another session's generation.
+    if loaded_models | awk -v m="$model" '$1 == m { found = 1 } END { exit !found }' \
+       && [ "$(requests_in_flight)" != "0" ]; then
+      echo "claude-local: '$model' is loaded and busy with another request" >&2
+    else
+      echo "claude-local: loading '$model'..." >&2
+      warm_model || die "the model failed to load; see $OMLX_LOG"
+    fi
     echo "claude-local: ready at $base_url ($profile, vision $vision)"
+    exit 0
+    ;;
+  resolve)
+    # For claude-remote on another Mac: the model and settings a session here
+    # would use. A sentinel line first, then key=value lines.
+    if [ -n "$vision_ctx" ]; then has_vision=yes; else has_vision=no; fi
+    echo "claude-local-resolve 1"
+    printf '%s=%s\n' class "$class" profile "$profile" vision "$vision" model "$model" ctx "$ctx" \
+      max_out "$max_out" caps "$caps" has_vision "$has_vision" fast_vision "$fast_vision" lean "$lean" \
+      server_port "$port"
     exit 0
     ;;
 esac
@@ -668,89 +826,409 @@ if ! is_subcommand "${1:-}"; then
   [ -t 2 ] && echo "claude-local: $profile, vision $vision -> $model, context $ctx" >&2
 fi
 
-[ -d "$LOCAL_CONFIG_DIR" ] || mkdir -p "$LOCAL_CONFIG_DIR"
-
-# Drop anything that could route or authenticate elsewhere.
-unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_PROFILE ANTHROPIC_BETAS \
-  ANTHROPIC_SMALL_FAST_MODEL CLAUDE_CODE_SIMPLE CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX \
-  CLAUDE_CODE_USE_FOUNDRY CLAUDE_CODE_USE_MANTLE CLAUDE_CODE_USE_GATEWAY \
-  CLAUDE_CODE_USE_ANTHROPIC_AWS CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD \
-  CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT \
-  CLAUDE_CODE_AUTO_COMPACT_WINDOW CLAUDE_SECURESTORAGE_CONFIG_DIR CLAUDE_CODE_MODEL_CAPABILITIES
-
-# Isolated profile and local endpoint.
-export CLAUDE_CONFIG_DIR="$LOCAL_CONFIG_DIR"
-export ANTHROPIC_BASE_URL="$base_url"
-export ANTHROPIC_AUTH_TOKEN="$token"
-
-# Every model tier maps to the one loaded model.
-export ANTHROPIC_MODEL="$model" CLAUDE_CODE_SUBAGENT_MODEL="$model"
-export ANTHROPIC_DEFAULT_FABLE_MODEL="$model" ANTHROPIC_DEFAULT_OPUS_MODEL="$model"
-export ANTHROPIC_DEFAULT_SONNET_MODEL="$model" ANTHROPIC_DEFAULT_HAIKU_MODEL="$model"
-
-# Context: Claude Code assumes 200K for unknown models; declare the real window.
-export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$ctx" CLAUDE_CODE_MAX_OUTPUT_TOKENS="$max_out"
-
-# Keep the prompt prefix stable so the server's prefix cache hits.
-export CLAUDE_CODE_ATTRIBUTION_HEADER=0 CLAUDE_CODE_TOTAL_TOKENS_REMINDER=off
-
-# Most of these models' chat templates reject system messages after the first
-# one, and oMLX then moves them to the front, which breaks the prefix cache.
-[ -z "$caps" ] || export CLAUDE_CODE_MODEL_CAPABILITIES="$caps"
-
-# Compatibility with a non-Anthropic backend.
-export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1 ENABLE_CLAUDEAI_MCP_SERVERS=false
-export CLAUDE_CODE_DISABLE_FAST_MODE=1 CLAUDE_CODE_AUTO_MODE_SERVER=0
-export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
-
-# One server slot: no background side requests or parallel subagents.
-export CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=1 CLAUDE_CODE_ENABLE_AWAY_SUMMARY=0
-export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false
-export CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1
-
-# Local prefill of long prompts can take minutes.
-export API_TIMEOUT_MS=3000000 CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS=1800000
-export CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS=600000
-
-is_subcommand "${1:-}" && exec "$CLAUDE_BIN" "$@"
-
-# Lean: a smaller tool set cuts Claude Code's prompt from ~16K to ~4.5K
-# tokens, which a slow Mac needs minutes to process on every cache miss.
-if [ "$lean" = "on" ]; then
-  set -- --tools=Read,Edit,Write,Bash,Grep,Glob --disable-slash-commands "$@"
-fi
-
-# Without vision the server drops images silently. A hook on the Read tool
-# refuses image files with a clear message instead. (Deny rules would also
-# hide image files from Glob and Grep.) The reason must not contain a quote.
-if [ "$vision" = "off" ]; then
-  if [ -n "$vision_ctx" ]; then
-    how="Tell the user to relaunch with claude-local --local-vision."
-  else
-    catalog fast
-    if [ -n "$vision_ctx" ]; then
-      how="This model has no image input; tell the user to relaunch with claude-local --local-fast --local-vision."
-    else
-      how="No model on this Mac has image input."
-    fi
-  fi
-  reason="Image input is off in this claude-local session, so image files cannot be viewed. There is no workaround: do not try to decode, OCR or convert images with shell commands or scripts. $how"
-  deny=$(/usr/bin/jq -cn --arg r "$reason" \
-    '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $r}}')
-  image_hook="/usr/bin/jq -r '.tool_input.file_path // empty' | /usr/bin/grep -qiE '[.](png|jpe?g|gif|webp)\$' || exit 0
-printf '%s\n' '$deny'"
-  hook_settings=$(/usr/bin/jq -cn --arg c "$image_hook" \
-    '{hooks: {PreToolUse: [{matcher: "Read", hooks: [{type: "command", command: $c}]}]}}')
-  set -- "--settings=$hook_settings" "$@"
-fi
-
-# WebSearch is an Anthropic server-side tool; LSP schema changes break the
-# prefix cache.
-exec "$CLAUDE_BIN" --strict-mcp-config --exclude-dynamic-system-prompt-sections \
-  --disallowedTools=WebSearch,LSP "$@"
+# The vision hook's advice depends on the model and on the Mac's fast model.
+if [ -n "$vision_ctx" ]; then has_vision=yes; else has_vision=no; fi
+launch_claude "$@"
 CLAUDE_LOCAL_SCRIPT
-chmod 755 "$NEW_WRAPPER"
+cat > "$NEW_REMOTE" <<'CLAUDE_REMOTE_SCRIPT'
+#!/bin/bash
+# claude-remote: run Claude Code on this Mac against a model served by another
+# Mac's claude-local (its oMLX server), reached through an SSH tunnel.
+#
+# The other Mac (the host) needs the full claude-local install, and Remote
+# Login with key-based SSH from this Mac. Claude Code, its local-model profile
+# (~/.claude-local) and the org-managed settings stay on this Mac; only the
+# model runs on the host, whose server stays bound to its own 127.0.0.1.
+#
+# Options (they must come before any Claude Code arguments):
+#   --remote-fast | --remote-quality | --remote-laguna   choose the model
+#                         (default: the host's own default)
+#   --remote-vision | --remote-no-vision   image input on or off
+#   --remote-host=NAME    the SSH host: an ssh alias, hostname or user@host;
+#                         several, separated by spaces or commas, are tried in order
+#   --remote-fallback | --remote-no-fallback   if no host answers, use this
+#                         Mac's own model with claude-local, or stop (the default)
+#   --remote-set-default  save the options given with it, then exit
+#   --remote-status       show the hosts, this Mac's tunnels and the host's models
+#   --remote-start        load the model on the host ahead of time, then exit
+#   --remote-disconnect   close this Mac's tunnels (their sessions lose the model)
+#   --remote-help         show this help
+#
+# Environment: CLAUDE_REMOTE_HOST, CLAUDE_REMOTE_PROFILE=fast|quality|laguna,
+# CLAUDE_REMOTE_VISION=on|off, CLAUDE_REMOTE_FALLBACK=on|off. Precedence:
+# option > environment > saved default > the host's own default. Saved
+# defaults live in ~/.config/claude-local/remote (or $XDG_CONFIG_HOME).
+#
+# Each session opens its own tunnel on a free local port (18765-18799). A small
+# supervisor process reconnects it if it drops, keeps the host awake with
+# 5-minute caffeinate leases, and closes it when the session ends.
+
+set -euo pipefail
+
+warn() { echo "claude-remote: warning: $*" >&2; }
+die() { echo "claude-remote: $*" >&2; exit 1; }
+
+SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+CLAUDE_LOCAL="$SELF_DIR/claude-local"
+[ -x "$CLAUDE_LOCAL" ] || CLAUDE_LOCAL="$HOME/.local/bin/claude-local"
+STATE_DIR="$HOME/.claude-local/remote"
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-local/remote"
+PORT_FIRST=18765
+PORT_LAST=18799
+
+# SSH options for every connection: never prompt, fail fast (about 13 s for an
+# unreachable host), notice a dead link within a minute, and ignore any
+# ControlMaster setup in ~/.ssh/config.
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=6 -o ConnectionAttempts=2
+  -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ControlPersist=no
+  -o ForwardAgent=no -o LogLevel=ERROR)
+# The host keeps its idle sleep off while a lease runs; each lease lasts 5
+# minutes and is renewed every 2, so the host sleeps normally once no session
+# renews it. A new lease ends the older ones (the unusual 301 s marks them),
+# so the host holds one however many sessions use it.
+LEASE='caffeinate -i -t 301 </dev/null >/dev/null 2>&1 & n=$!; for p in $(pgrep -f "^caffeinate -i -t 301$"); do [ "$p" = "$n" ] || kill "$p" 2>/dev/null; done;'
+
+# --- Helpers ---------------------------------------------------------------------
+valid_host() {
+  case "$1" in
+    ""|-*|*[!A-Za-z0-9._@-]*) return 1 ;;
+  esac
+  return 0
+}
+
+# Paths for one session's tunnel; sockets stay well under macOS's 104-byte limit.
+set_paths() {  # set_paths <host> <id>
+  local h
+  h=$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-24)
+  sock="$STATE_DIR/$h-$2.sock"
+  info="$STATE_DIR/$h-$2.info"
+  log="$STATE_DIR/$h.log"
+}
+
+# ssh through this session's master connection, or directly (no tunnel).
+mssh() { ssh "${SSH_OPTS[@]}" -o ControlMaster=no -S "$sock" -- "$host" "$@"; }
+dssh() { ssh "${SSH_OPTS[@]}" -o ControlMaster=no -o ControlPath=none -- "$host" "$@"; }
+
+# Open the master connection for this session; true when it is up.
+open_master() {
+  rm -f "$sock"
+  ssh "${SSH_OPTS[@]}" -f -N -M -S "$sock" -E "$log" -- "$host" </dev/null >>"$log" 2>&1 || return 1
+  ssh -S "$sock" -O check -- "$host" >/dev/null 2>&1
+}
+
+# Forward local <port> to the host's oMLX port over the master.
+add_forward() {  # add_forward <port> <server_port>
+  ssh -S "$sock" -O forward -L "127.0.0.1:$1:127.0.0.1:$2" -- "$host" >/dev/null 2>&1
+}
+
+port_in_use() {
+  [ -n "$(lsof -nP -tiTCP:"$1" -sTCP:LISTEN 2>/dev/null | head -1)" ]
+}
+
+# Show the host's output with its name, and with the model and vision options
+# as they are typed here (the host's claude-local speaks of --local-*).
+relabel() {
+  awk -v h="$host" '{
+    gsub(/--local-fast/, "--remote-fast"); gsub(/--local-quality/, "--remote-quality")
+    gsub(/--local-laguna/, "--remote-laguna"); gsub(/--local-no-vision/, "--remote-no-vision")
+    gsub(/--local-vision/, "--remote-vision"); print h ": " $0; fflush() }'
+}
+
+# The host's claude-local, as a remote shell command.
+remote_cl='b="$HOME/.local/bin/claude-local"; [ -x "$b" ] || { echo "claude-local is not installed on this Mac" >&2; exit 3; };'
+
+# --- Supervisor (hidden mode) ------------------------------------------------------
+# Runs in the background for one session: keeps its tunnel up and the host
+# awake while the session's process lives, then closes the tunnel.
+if [ "${1:-}" = "--remote-supervise" ]; then
+  set +e
+  trap '' HUP INT
+  stop=0
+  trap 'stop=1' TERM
+  owner=$2 host=$3 port=$4 server_port=$5 id=$6
+  set_paths "$host" "$id"
+  started=$(ps -o lstart= -p "$owner" 2>/dev/null)
+  [ -n "$started" ] || exit 0
+  echo "supervisor=$$ owner=$owner port=$port" > "$info"
+  lease=$(date +%s)   # the launch just took one
+  back=1
+  say() { echo "$(date '+%Y-%m-%d %H:%M:%S') [$id port $port] $*" >> "$log"; }
+  say "session started"
+  while [ "$stop" = 0 ] && [ "$(ps -o lstart= -p "$owner" 2>/dev/null)" = "$started" ]; do
+    if ! ssh -S "$sock" -O check -- "$host" >/dev/null 2>&1; then
+      say "tunnel down; reconnecting"
+      if open_master && add_forward "$port" "$server_port"; then
+        say "reconnected"
+        back=1
+        lease=0
+      else
+        sleep "$back"
+        back=$(( back < 30 ? back * 2 : 30 ))
+        continue
+      fi
+    fi
+    now=$(date +%s)
+    if [ $(( now - lease )) -ge 120 ] && mssh "$LEASE" >/dev/null 2>&1; then lease=$now; fi
+    sleep 5
+  done
+  ssh -S "$sock" -O exit -- "$host" >/dev/null 2>&1
+  rm -f "$sock" "$info"
+  say "session ended; tunnel closed"
+  exit 0
+fi
+
+# --- Options -----------------------------------------------------------------------
+opt_profile=""
+opt_vision=""
+opt_hosts=""
+opt_fallback=""
+cmd=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --remote-fast) opt_profile=fast ;;
+    --remote-quality) opt_profile=quality ;;
+    --remote-laguna) opt_profile=laguna ;;
+    --remote-vision) opt_vision=on ;;
+    --remote-no-vision) opt_vision=off ;;
+    --remote-fallback) opt_fallback=on ;;
+    --remote-no-fallback) opt_fallback=off ;;
+    --remote-host=*) opt_hosts=$(printf '%s' "${1#--remote-host=}" | tr ',' ' ') ;;
+    --remote-host) die "use --remote-host=NAME" ;;
+    --remote-status|--remote-start|--remote-disconnect|--remote-help|--remote-set-default)
+      [ -z "$cmd" ] || die "one of --remote-status/start/disconnect/help/set-default at a time"
+      cmd="${1#--remote-}" ;;
+    --remote-*) echo "claude-remote: unknown option '$1' (see claude-remote --remote-help)" >&2; exit 2 ;;
+    --local-*) die "'$1' is a claude-local option; claude-remote's are --remote-* (see claude-remote --remote-help)" ;;
+    *) break ;;
+  esac
+  shift
+done
+
+if [ "$cmd" = "help" ]; then
+  awk 'NR > 1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0"
+  exit 0
+fi
+[ -x "$CLAUDE_LOCAL" ] || die "claude-local not found next to claude-remote or in ~/.local/bin; run install-claude-local.sh (--client-only is enough)"
+
+# Claude Code subcommands (mcp, doctor, ...) need no model: no tunnel.
+if [ -z "$cmd" ] && "$CLAUDE_LOCAL" --local-subcommand "${1:-}" 2>/dev/null; then
+  exec "$CLAUDE_LOCAL" "$@"
+fi
+
+# Saved defaults: host= or hosts=, profile=, vision=, fallback=.
+saved_hosts=""
+saved_profile=""
+saved_vision=""
+saved_fallback=""
+if [ -r "$CONFIG_FILE" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%%#*}
+    key=$(printf '%s' "${line%%=*}" | tr -d '[:space:]')
+    val=$(printf '%s' "${line#*=}" | tr ',' ' ' | awk '{ $1 = $1; print }')
+    case "$key=$val" in
+      "=") ;;
+      host=?*|hosts=?*) saved_hosts=$val ;;
+      profile=fast|profile=quality|profile=laguna) saved_profile=$val ;;
+      vision=on|vision=off) saved_vision=$val ;;
+      fallback=on|fallback=off) saved_fallback=$val ;;
+      *) warn "ignoring '$line' in $CONFIG_FILE" ;;
+    esac
+  done < "$CONFIG_FILE"
+fi
+
+case "${CLAUDE_REMOTE_PROFILE:-}" in ""|fast|quality|laguna) ;; *) die "CLAUDE_REMOTE_PROFILE must be fast, quality or laguna" ;; esac
+case "${CLAUDE_REMOTE_VISION:-}" in ""|on|off) ;; *) die "CLAUDE_REMOTE_VISION must be on or off" ;; esac
+case "${CLAUDE_REMOTE_FALLBACK:-}" in ""|on|off) ;; *) die "CLAUDE_REMOTE_FALLBACK must be on or off" ;; esac
+hosts=${opt_hosts:-${CLAUDE_REMOTE_HOST:-$saved_hosts}}
+hosts=$(printf '%s' "$hosts" | tr ',' ' ')
+profile=${opt_profile:-${CLAUDE_REMOTE_PROFILE:-$saved_profile}}
+vision=${opt_vision:-${CLAUDE_REMOTE_VISION:-$saved_vision}}
+fallback=${opt_fallback:-${CLAUDE_REMOTE_FALLBACK:-${saved_fallback:-off}}}
+for h in $hosts; do
+  valid_host "$h" || die "'$h' is not a valid host name (use an ssh alias, hostname or user@host)"
+done
+
+if [ "$cmd" = "set-default" ]; then
+  [ -n "$opt_hosts$opt_profile$opt_vision$opt_fallback" ] \
+    || die "give --remote-host=NAME, a model, a vision setting and/or --remote-fallback to save"
+  new_hosts=${opt_hosts:-$saved_hosts}
+  new_profile=${opt_profile:-$saved_profile}
+  new_vision=${opt_vision:-$saved_vision}
+  new_fallback=${opt_fallback:-$saved_fallback}
+  mkdir -p "$(dirname "$CONFIG_FILE")"
+  tmp=$(mktemp "$CONFIG_FILE.XXXXXX")
+  {
+    echo "# claude-remote saved defaults (claude-remote --remote-set-default); edit or delete freely"
+    [ -z "$new_hosts" ] || echo "hosts=$new_hosts"
+    [ -z "$new_profile" ] || echo "profile=$new_profile"
+    [ -z "$new_vision" ] || echo "vision=$new_vision"
+    [ -z "$new_fallback" ] || echo "fallback=$new_fallback"
+  } > "$tmp"
+  mv "$tmp" "$CONFIG_FILE"
+  echo "claude-remote: saved defaults to $CONFIG_FILE:"
+  grep -v '^#' "$CONFIG_FILE" | sed 's/^/  /'
+  exit 0
+fi
+
+# The host's claude-local options for the chosen model; empty means its default.
+ropts=""
+[ -z "$profile" ] || ropts="--local-$profile"
+case "$vision" in
+  on) ropts="$ropts --local-vision" ;;
+  off) ropts="$ropts --local-no-vision" ;;
+esac
+
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR"
+
+# --- Status and one-off commands -------------------------------------------------
+if [ "$cmd" = "disconnect" ]; then
+  n=0
+  for f in "$STATE_DIR"/*.info; do
+    [ -f "$f" ] || continue
+    sup=$(sed -n 's/.*supervisor=\([0-9]*\).*/\1/p' "$f")
+    [ -n "$sup" ] && kill -TERM "$sup" 2>/dev/null && n=$((n + 1))
+  done
+  echo "claude-remote: asked $n tunnel(s) to close"
+  exit 0
+fi
+
+if [ "$cmd" = "status" ]; then
+  [ -n "$hosts" ] || echo "hosts:      none set; use claude-remote --remote-host=NAME --remote-set-default"
+  echo "hosts:      ${hosts:-none}$([ -n "$opt_hosts$saved_hosts" ] || [ -z "${CLAUDE_REMOTE_HOST:-}" ] || echo ' (CLAUDE_REMOTE_HOST)')"
+  hd="the host's default"
+  echo "choice:     model ${profile:-$hd}, vision ${vision:-$hd}, fallback $fallback"
+  echo "defaults:   $CONFIG_FILE$([ -r "$CONFIG_FILE" ] || echo ' (none saved)')"
+  echo "tunnels on this Mac:"
+  shown=0
+  for f in "$STATE_DIR"/*.info; do
+    [ -f "$f" ] || continue
+    printf '            %s: %s\n' "$(basename "$f" .info)" "$(cat "$f")"
+    shown=1
+  done
+  [ "$shown" = 1 ] || echo "            none"
+  mine=$(shasum -a 256 "$CLAUDE_LOCAL" | cut -c1-12)
+  for host in $hosts; do
+    echo
+    printf '%s: ' "$host"
+    if ! dssh true 2>/dev/null; then
+      echo "not reachable (asleep, off the network, or SSH not set up)"
+      continue
+    fi
+    echo "reachable"
+    theirs=$(dssh 'shasum -a 256 "$HOME/.local/bin/claude-local" 2>/dev/null | cut -c1-12' 2>/dev/null || true)
+    if [ "$theirs" = "$mine" ]; then
+      echo "  claude-local: same version as this Mac's"
+    else
+      echo "  claude-local: differs from this Mac's (${theirs:-not installed} vs $mine); keep both up to date"
+    fi
+    echo "  keep-awake leases: $(dssh 'pgrep -f "^caffeinate -i -t 301$" | wc -l | tr -d " "' 2>/dev/null || echo '?')"
+    dssh "$remote_cl \"\$b\" $ropts --local-status" 2>&1 | sed 's/^/  /' || true
+  done
+  exit 0
+fi
+
+[ -n "$hosts" ] || die "no host set; run claude-remote --remote-host=NAME --remote-set-default (NAME: an ssh alias, hostname or user@host)"
+
+if [ "$cmd" = "start" ]; then
+  for host in $hosts; do
+    if dssh "$LEASE $remote_cl \"\$b\" $ropts --local-start" 2> >(relabel >&2); then exit 0; fi
+    warn "$host: couldn't load the model (see above); trying the next host, if any"
+  done
+  die "no host could load the model"
+fi
+
+# --- Launch ------------------------------------------------------------------------
+fall_back() {  # fall_back <reason> <Claude Code arguments...>
+  local reason=$1
+  shift
+  if [ "$fallback" = "on" ]; then
+    warn "$reason; using this Mac's own model instead (claude-local)"
+    [ -z "$profile" ] || set -- "--local-$profile" "$@"
+    exec "$CLAUDE_LOCAL" "$@"
+  fi
+  die "$reason. Wake it or check the network, use claude-local for this Mac's own model, or add --remote-fallback."
+}
+
+host=""
+for h in $hosts; do
+  set_paths "$h" "$$"
+  host=$h
+  if open_master; then break; fi
+  warn "$h is not reachable (asleep, off the network, or SSH not set up)"
+  host=""
+done
+[ -n "$host" ] || fall_back "no host answered ($hosts)" "$@"
+# Until the supervisor takes over, close the tunnel if this launch stops.
+trap 'ssh -S "$sock" -O exit -- "$host" >/dev/null 2>&1; rm -f "$sock"' EXIT
+
+# Start (or reuse) the model on the host, then ask it what a session uses.
+out=$(mssh "$LEASE $remote_cl \"\$b\" $ropts --local-start >&2 && exec \"\$b\" $ropts --local-resolve" \
+  2> >(relabel >&2)) || rc=$?
+rc=${rc:-0}
+kv=$(printf '%s\n' "$out" | sed -n '/^claude-local-resolve 1$/,$p' | sed 1d)
+if [ -z "$kv" ]; then
+  case "$rc" in
+    2) die "claude-local on $host is older than claude-remote needs; update it there (re-run install-claude-local.sh)" ;;
+    3) die "claude-local is not installed on $host; install it there first" ;;
+    *) die "$host couldn't start the model (see its messages above)" ;;
+  esac
+fi
+r_class="" r_profile="" r_vision="" r_model="" r_ctx="" r_out="" r_caps="" r_has="" r_fast="" r_lean="" r_port=""
+while IFS= read -r line; do
+  k=${line%%=*}
+  v=${line#*=}
+  case "$k" in
+    class) r_class=$v ;;
+    profile) r_profile=$v ;;
+    vision) r_vision=$v ;;
+    model) r_model=$v ;;
+    ctx) r_ctx=$v ;;
+    max_out) r_out=$v ;;
+    caps) r_caps=$v ;;
+    has_vision) r_has=$v ;;
+    fast_vision) r_fast=$v ;;
+    lean) r_lean=$v ;;
+    server_port) r_port=$v ;;
+  esac
+done <<EOF
+$kv
+EOF
+for v in "$r_ctx" "$r_out" "$r_port"; do
+  case "$v" in ""|*[!0-9]*) die "$host sent an unexpected answer; check claude-local there" ;; esac
+done
+case "$r_model" in ""|*[!A-Za-z0-9._-]*) die "$host sent an unexpected model name" ;; esac
+case "$r_caps" in *[!A-Za-z0-9_,-]*) die "$host sent unexpected model settings" ;; esac
+case "$r_profile:$r_vision:$r_has:$r_fast:$r_lean" in
+  fast:*|quality:*|laguna:*) ;;
+  *) die "$host sent an unexpected answer; check claude-local there" ;;
+esac
+
+# Forward a free local port to the host's server.
+port=""
+p=$PORT_FIRST
+while [ "$p" -le "$PORT_LAST" ]; do
+  if ! port_in_use "$p" && add_forward "$p" "$r_port"; then port=$p; break; fi
+  p=$((p + 1))
+done
+[ -n "$port" ] || die "no free local port between $PORT_FIRST and $PORT_LAST for the tunnel"
+
+# Hand the tunnel to a supervisor in its own process group. This process
+# keeps its pid through the exec into claude-local and then Claude Code, so
+# the supervisor can tell when the session ends.
+( set -m; nohup "$0" --remote-supervise "$$" "$host" "$port" "$r_port" "$$" </dev/null >>"$log" 2>&1 & )
+trap - EXIT
+
+export CLAUDE_LOCAL_REMOTE="$host" CLAUDE_LOCAL_REMOTE_PORT="$port" CLAUDE_LOCAL_REMOTE_MODEL="$r_model"
+export CLAUDE_LOCAL_REMOTE_CTX="$r_ctx" CLAUDE_LOCAL_REMOTE_MAX_OUT="$r_out" CLAUDE_LOCAL_REMOTE_CAPS="$r_caps"
+export CLAUDE_LOCAL_REMOTE_PROFILE="$r_profile" CLAUDE_LOCAL_REMOTE_VISION="$r_vision"
+export CLAUDE_LOCAL_REMOTE_HAS_VISION="$r_has" CLAUDE_LOCAL_REMOTE_FAST_VISION="$r_fast"
+export CLAUDE_LOCAL_REMOTE_LEAN="$r_lean" CLAUDE_LOCAL_REMOTE_CLASS="$r_class"
+exec "$CLAUDE_LOCAL" "$@"
+CLAUDE_REMOTE_SCRIPT
+chmod 755 "$NEW_WRAPPER" "$NEW_REMOTE"
 bash -n "$NEW_WRAPPER" || die "internal error: the embedded wrapper has a syntax error"
+bash -n "$NEW_REMOTE" || die "internal error: the embedded claude-remote has a syntax error"
 CATALOG=$("$NEW_WRAPPER" --local-catalog) || die "internal error: the embedded wrapper has no catalog"
 
 # cat_field <profile> <field>: this Mac's catalog entry for a role ('-' = none).
@@ -801,6 +1279,115 @@ clear_window() {  # clear_window <alias>
   mv "$tmp" "$WINDOWS_FILE"
 }
 
+# The Claude Code profile for local and remote sessions (INSTALL.md step 5).
+setup_profile() {
+  mkdir -p "$PROFILE"
+  if [ -e "$HOME/.claude/CLAUDE.md" ] && [ ! -e "$PROFILE/CLAUDE.md" ]; then
+    ln -s "$HOME/.claude/CLAUDE.md" "$PROFILE/CLAUDE.md"
+    info "linked ~/.claude-local/CLAUDE.md -> ~/.claude/CLAUDE.md"
+  fi
+  if [ -e "$PROFILE/settings.json" ]; then
+    info "~/.claude-local/settings.json already exists; leaving it alone"
+  else
+    { [ -f "$HOME/.claude/settings.json" ] && cat "$HOME/.claude/settings.json" || echo '{}'; } \
+      | "$JQ" '{cleanupPeriodDays, theme, hooks} | with_entries(select(.value != null))
+          + {effortLevel: "medium", useAutoModeDuringPlan: false, disableClaudeAiConnectors: true,
+             permissions: {defaultMode: "default"}}' > "$PROFILE/settings.json"
+    info "wrote ~/.claude-local/settings.json (theme and hooks copied from ~/.claude/settings.json)"
+  fi
+}
+
+# install_script <new> <dest>: install a wrapper, backing up a different one.
+install_script() {
+  local new="$1" dest="$2" backup
+  mkdir -p "$(dirname "$dest")"
+  if [ -f "$dest" ] && cmp -s "$new" "$dest"; then
+    info "$dest is up to date"
+  else
+    if [ -f "$dest" ]; then
+      backup="$dest.bak-$(date +%Y%m%d-%H%M%S)"
+      cp -p "$dest" "$backup"
+      info "backed up the previous $(basename "$dest") to $backup"
+    fi
+    cp "$new" "$dest.new"
+    mv "$dest.new" "$dest"
+    info "installed $dest"
+  fi
+  chmod 755 "$dest"
+}
+
+# Normal Claude Code must be exactly as the baseline recorded it.
+check_normal_claude() {
+  if [ "$(settings_sha)" = "$(cat "$BASELINE/sha.txt")" ]; then
+    pass "normal Claude Code settings unchanged"
+  else
+    fail "normal Claude Code settings differ from the baseline in $BASELINE"
+  fi
+  # Compare only who is logged in and how; other status fields can vary.
+  login_fields() {  # the JSON fields, or the raw text if it isn't JSON
+    local raw
+    raw=$(cat)
+    printf '%s' "$raw" | "$JQ" -S '{loggedIn, authMethod, email, orgId}' 2>/dev/null || printf '%s\n' "$raw"
+  }
+  if [ "$("$CLAUDE_BIN" auth status 2>/dev/null | login_fields)" = "$(login_fields < "$BASELINE/auth.txt")" ]; then
+    pass "normal Claude Code login unchanged"
+  else
+    fail "normal Claude Code login differs from the baseline in $BASELINE"
+  fi
+}
+
+record_baseline() {
+  if [ -f "$BASELINE/sha.txt" ]; then
+    info "baseline of normal Claude Code already in $BASELINE"
+  else
+    mkdir -p "$BASELINE"
+    settings_sha > "$BASELINE/sha.txt"
+    "$CLAUDE_BIN" auth status > "$BASELINE/auth.txt" 2>/dev/null || true
+    info "recorded a baseline of normal Claude Code in $BASELINE"
+  fi
+}
+
+find_claude() {
+  CLAUDE_BIN="$HOME/.local/bin/claude"
+  [ -x "$CLAUDE_BIN" ] || CLAUDE_BIN="$(command -v claude || true)"
+  [ -n "$CLAUDE_BIN" ] || die "Claude Code not found. Install it first (https://code.claude.com/docs) and log in."
+  info "Claude Code: $CLAUDE_BIN ($("$CLAUDE_BIN" --version 2>/dev/null | head -1))"
+}
+
+check_path() {
+  case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *) warn "~/.local/bin is not on your PATH; add it to run claude-local and claude-remote by name." ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Client only: the wrappers and the profile, for models on another Mac.
+if [ "$client_only" -eq 1 ]; then
+  step "1/3 Checking this Mac (client only: no oMLX or models)"
+  info "$(sysctl -n machdep.cpu.brand_string), macOS $(sw_vers -productVersion)"
+  [ -x "$JQ" ] || die "/usr/bin/jq not found (it ships with macOS 15 and later)."
+  find_claude
+  check_path
+  record_baseline
+  step "2/3 Creating the isolated Claude Code profile ~/.claude-local (INSTALL.md step 5)"
+  setup_profile
+  step "3/3 Installing the claude-local and claude-remote wrappers"
+  install_script "$NEW_WRAPPER" "$WRAPPER"
+  install_script "$NEW_REMOTE" "$REMOTE_WRAPPER"
+  problems=0
+  pass() { info "PASS $*"; }
+  fail() { warn "FAIL $*"; problems=$((problems + 1)); }
+  check_normal_claude
+  echo
+  echo "Installed. Next, point claude-remote at a Mac that runs the full install:"
+  echo "  claude-remote --remote-host=NAME --remote-set-default   NAME: an ssh alias, hostname or user@host"
+  echo "  claude-remote --remote-status                          check the host and its models"
+  echo "  claude-remote                                          a session with the host's default model"
+  [ "$problems" -eq 0 ]
+  exit
+fi
+
 # ---------------------------------------------------------------------------
 step "1/8 Checking this Mac"
 [ "$(uname -m)" = "arm64" ] || die "Apple Silicon is required."
@@ -820,10 +1407,7 @@ for p in fast quality laguna; do
 done
 [ -x "$JQ" ] || die "/usr/bin/jq not found (it ships with macOS 15 and later)."
 
-CLAUDE_BIN="$HOME/.local/bin/claude"
-[ -x "$CLAUDE_BIN" ] || CLAUDE_BIN="$(command -v claude || true)"
-[ -n "$CLAUDE_BIN" ] || die "Claude Code not found. Install it first (https://code.claude.com/docs) and log in."
-info "Claude Code: $CLAUDE_BIN ($("$CLAUDE_BIN" --version 2>/dev/null | head -1))"
+find_claude
 
 # Disk: each model still to download, plus room for oMLX and some slack. The
 # SSD prompt cache grows later, up to its cap (step 5).
@@ -853,19 +1437,8 @@ if [ -n "$pid" ]; then
 else
   info "port $PORT: free"
 fi
-case ":$PATH:" in
-  *":$HOME/.local/bin:"*) ;;
-  *) warn "~/.local/bin is not on your PATH; add it to run claude-local by name." ;;
-esac
-
-if [ -f "$BASELINE/sha.txt" ]; then
-  info "baseline of normal Claude Code already in $BASELINE"
-else
-  mkdir -p "$BASELINE"
-  settings_sha > "$BASELINE/sha.txt"
-  "$CLAUDE_BIN" auth status > "$BASELINE/auth.txt" 2>/dev/null || true
-  info "recorded a baseline of normal Claude Code in $BASELINE"
-fi
+check_path
+record_baseline
 
 # ---------------------------------------------------------------------------
 step "2/8 Installing oMLX $OMLX_TAG into ~/Applications (INSTALL.md step 2)"
@@ -892,7 +1465,7 @@ else
 
   mnt=$(mktemp -d)
   hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$dmg" >/dev/null 2>&1 || die "Could not mount $dmg."
-  trap 'hdiutil detach "$mnt" >/dev/null 2>&1 || true; rm -f "$NEW_WRAPPER"' EXIT
+  trap 'hdiutil detach "$mnt" >/dev/null 2>&1 || true; rm -f "$NEW_WRAPPER" "$NEW_REMOTE"' EXIT
   codesign --verify --deep --strict "$mnt/oMLX.app" 2>/dev/null || die "oMLX.app failed its code-signature check."
   spctl -a -t exec "$mnt/oMLX.app" 2>/dev/null || die "Gatekeeper did not accept oMLX.app (not notarized?)."
   info "signed and notarized: $(codesign -dv --verbose=2 "$mnt/oMLX.app" 2>&1 | sed -n 's/^Authority=\(Developer ID Application.*\)/\1/p')"
@@ -905,7 +1478,7 @@ else
   rm -rf "$APP"
   mv "$APP.new" "$APP"
   hdiutil detach "$mnt" >/dev/null 2>&1 || true
-  trap 'rm -f "$NEW_WRAPPER"' EXIT
+  trap 'rm -f "$NEW_WRAPPER" "$NEW_REMOTE"' EXIT
   info "installed oMLX $("$OMLX_CLI" --version) at $APP"
   info "(don't open it from Finder; claude-local runs its server headless)"
 fi
@@ -1302,37 +1875,12 @@ fi
 
 # ---------------------------------------------------------------------------
 step "6/8 Creating the isolated Claude Code profile ~/.claude-local (INSTALL.md step 5)"
-mkdir -p "$PROFILE"
-if [ -e "$HOME/.claude/CLAUDE.md" ] && [ ! -e "$PROFILE/CLAUDE.md" ]; then
-  ln -s "$HOME/.claude/CLAUDE.md" "$PROFILE/CLAUDE.md"
-  info "linked ~/.claude-local/CLAUDE.md -> ~/.claude/CLAUDE.md"
-fi
-if [ -e "$PROFILE/settings.json" ]; then
-  info "~/.claude-local/settings.json already exists; leaving it alone"
-else
-  { [ -f "$HOME/.claude/settings.json" ] && cat "$HOME/.claude/settings.json" || echo '{}'; } \
-    | "$JQ" '{cleanupPeriodDays, theme, hooks} | with_entries(select(.value != null))
-        + {effortLevel: "medium", useAutoModeDuringPlan: false, disableClaudeAiConnectors: true,
-           permissions: {defaultMode: "default"}}' > "$PROFILE/settings.json"
-  info "wrote ~/.claude-local/settings.json (theme and hooks copied from ~/.claude/settings.json)"
-fi
+setup_profile
 
 # ---------------------------------------------------------------------------
-step "7/8 Installing the claude-local wrapper (INSTALL.md step 6)"
-mkdir -p "$(dirname "$WRAPPER")"
-if [ -f "$WRAPPER" ] && cmp -s "$NEW_WRAPPER" "$WRAPPER"; then
-  info "$WRAPPER is up to date"
-else
-  if [ -f "$WRAPPER" ]; then
-    backup="$WRAPPER.bak-$(date +%Y%m%d-%H%M%S)"
-    cp -p "$WRAPPER" "$backup"
-    info "backed up the previous wrapper to $backup"
-  fi
-  cp "$NEW_WRAPPER" "$WRAPPER.new"
-  mv "$WRAPPER.new" "$WRAPPER"
-  info "installed $WRAPPER"
-fi
-chmod 755 "$WRAPPER"
+step "7/8 Installing the claude-local and claude-remote wrappers (INSTALL.md step 6)"
+install_script "$NEW_WRAPPER" "$WRAPPER"
+install_script "$NEW_REMOTE" "$REMOTE_WRAPPER"
 
 # ---------------------------------------------------------------------------
 if [ "$verify" -eq 0 ]; then
@@ -1550,22 +2098,7 @@ fi
 "$WRAPPER" --local-start >/dev/null 2>&1 \
   || warn "couldn't load the default model; the next claude-local launch will start it"
 
-if [ "$(settings_sha)" = "$(cat "$BASELINE/sha.txt")" ]; then
-  pass "normal Claude Code settings unchanged"
-else
-  fail "normal Claude Code settings differ from the baseline in $BASELINE"
-fi
-# Compare only who is logged in and how; other status fields can vary.
-login_fields() {  # the JSON fields, or the raw text if it isn't JSON
-  local raw
-  raw=$(cat)
-  printf '%s' "$raw" | "$JQ" -S '{loggedIn, authMethod, email, orgId}' 2>/dev/null || printf '%s\n' "$raw"
-}
-if [ "$("$CLAUDE_BIN" auth status 2>/dev/null | login_fields)" = "$(login_fields < "$BASELINE/auth.txt")" ]; then
-  pass "normal Claude Code login unchanged"
-else
-  fail "normal Claude Code login differs from the baseline in $BASELINE"
-fi
+check_normal_claude
 
 echo
 if [ "$problems" -eq 0 ]; then
@@ -1583,5 +2116,6 @@ for p in fast quality laguna; do
 done
 echo "  claude-local --local-status         this Mac's models, windows, server and memory warnings"
 echo "  claude-local --local-stop           stop the server and free the model's memory"
+echo "  claude-remote --remote-help         use a model on another Mac instead (see INSTALL.md)"
 [ "$class" != 16 ] && echo "In a session, /context should show about 16K tokens used."
 [ "$problems" -eq 0 ]

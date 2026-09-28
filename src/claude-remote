@@ -1,0 +1,394 @@
+#!/bin/bash
+# claude-remote: run Claude Code on this Mac against a model served by another
+# Mac's claude-local (its oMLX server), reached through an SSH tunnel.
+#
+# The other Mac (the host) needs the full claude-local install, and Remote
+# Login with key-based SSH from this Mac. Claude Code, its local-model profile
+# (~/.claude-local) and the org-managed settings stay on this Mac; only the
+# model runs on the host, whose server stays bound to its own 127.0.0.1.
+#
+# Options (they must come before any Claude Code arguments):
+#   --remote-fast | --remote-quality | --remote-laguna   choose the model
+#                         (default: the host's own default)
+#   --remote-vision | --remote-no-vision   image input on or off
+#   --remote-host=NAME    the SSH host: an ssh alias, hostname or user@host;
+#                         several, separated by spaces or commas, are tried in order
+#   --remote-fallback | --remote-no-fallback   if no host answers, use this
+#                         Mac's own model with claude-local, or stop (the default)
+#   --remote-set-default  save the options given with it, then exit
+#   --remote-status       show the hosts, this Mac's tunnels and the host's models
+#   --remote-start        load the model on the host ahead of time, then exit
+#   --remote-disconnect   close this Mac's tunnels (their sessions lose the model)
+#   --remote-help         show this help
+#
+# Environment: CLAUDE_REMOTE_HOST, CLAUDE_REMOTE_PROFILE=fast|quality|laguna,
+# CLAUDE_REMOTE_VISION=on|off, CLAUDE_REMOTE_FALLBACK=on|off. Precedence:
+# option > environment > saved default > the host's own default. Saved
+# defaults live in ~/.config/claude-local/remote (or $XDG_CONFIG_HOME).
+#
+# Each session opens its own tunnel on a free local port (18765-18799). A small
+# supervisor process reconnects it if it drops, keeps the host awake with
+# 5-minute caffeinate leases, and closes it when the session ends.
+
+set -euo pipefail
+
+warn() { echo "claude-remote: warning: $*" >&2; }
+die() { echo "claude-remote: $*" >&2; exit 1; }
+
+SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+CLAUDE_LOCAL="$SELF_DIR/claude-local"
+[ -x "$CLAUDE_LOCAL" ] || CLAUDE_LOCAL="$HOME/.local/bin/claude-local"
+STATE_DIR="$HOME/.claude-local/remote"
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-local/remote"
+PORT_FIRST=18765
+PORT_LAST=18799
+
+# SSH options for every connection: never prompt, fail fast (about 13 s for an
+# unreachable host), notice a dead link within a minute, and ignore any
+# ControlMaster setup in ~/.ssh/config.
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=6 -o ConnectionAttempts=2
+  -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ControlPersist=no
+  -o ForwardAgent=no -o LogLevel=ERROR)
+# The host keeps its idle sleep off while a lease runs; each lease lasts 5
+# minutes and is renewed every 2, so the host sleeps normally once no session
+# renews it. A new lease ends the older ones (the unusual 301 s marks them),
+# so the host holds one however many sessions use it.
+LEASE='caffeinate -i -t 301 </dev/null >/dev/null 2>&1 & n=$!; for p in $(pgrep -f "^caffeinate -i -t 301$"); do [ "$p" = "$n" ] || kill "$p" 2>/dev/null; done;'
+
+# --- Helpers ---------------------------------------------------------------------
+valid_host() {
+  case "$1" in
+    ""|-*|*[!A-Za-z0-9._@-]*) return 1 ;;
+  esac
+  return 0
+}
+
+# Paths for one session's tunnel; sockets stay well under macOS's 104-byte limit.
+set_paths() {  # set_paths <host> <id>
+  local h
+  h=$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-24)
+  sock="$STATE_DIR/$h-$2.sock"
+  info="$STATE_DIR/$h-$2.info"
+  log="$STATE_DIR/$h.log"
+}
+
+# ssh through this session's master connection, or directly (no tunnel).
+mssh() { ssh "${SSH_OPTS[@]}" -o ControlMaster=no -S "$sock" -- "$host" "$@"; }
+dssh() { ssh "${SSH_OPTS[@]}" -o ControlMaster=no -o ControlPath=none -- "$host" "$@"; }
+
+# Open the master connection for this session; true when it is up.
+open_master() {
+  rm -f "$sock"
+  ssh "${SSH_OPTS[@]}" -f -N -M -S "$sock" -E "$log" -- "$host" </dev/null >>"$log" 2>&1 || return 1
+  ssh -S "$sock" -O check -- "$host" >/dev/null 2>&1
+}
+
+# Forward local <port> to the host's oMLX port over the master.
+add_forward() {  # add_forward <port> <server_port>
+  ssh -S "$sock" -O forward -L "127.0.0.1:$1:127.0.0.1:$2" -- "$host" >/dev/null 2>&1
+}
+
+port_in_use() {
+  [ -n "$(lsof -nP -tiTCP:"$1" -sTCP:LISTEN 2>/dev/null | head -1)" ]
+}
+
+# Show the host's output with its name, and with the model and vision options
+# as they are typed here (the host's claude-local speaks of --local-*).
+relabel() {
+  awk -v h="$host" '{
+    gsub(/--local-fast/, "--remote-fast"); gsub(/--local-quality/, "--remote-quality")
+    gsub(/--local-laguna/, "--remote-laguna"); gsub(/--local-no-vision/, "--remote-no-vision")
+    gsub(/--local-vision/, "--remote-vision"); print h ": " $0; fflush() }'
+}
+
+# The host's claude-local, as a remote shell command.
+remote_cl='b="$HOME/.local/bin/claude-local"; [ -x "$b" ] || { echo "claude-local is not installed on this Mac" >&2; exit 3; };'
+
+# --- Supervisor (hidden mode) ------------------------------------------------------
+# Runs in the background for one session: keeps its tunnel up and the host
+# awake while the session's process lives, then closes the tunnel.
+if [ "${1:-}" = "--remote-supervise" ]; then
+  set +e
+  trap '' HUP INT
+  stop=0
+  trap 'stop=1' TERM
+  owner=$2 host=$3 port=$4 server_port=$5 id=$6
+  set_paths "$host" "$id"
+  started=$(ps -o lstart= -p "$owner" 2>/dev/null)
+  [ -n "$started" ] || exit 0
+  echo "supervisor=$$ owner=$owner port=$port" > "$info"
+  lease=$(date +%s)   # the launch just took one
+  back=1
+  say() { echo "$(date '+%Y-%m-%d %H:%M:%S') [$id port $port] $*" >> "$log"; }
+  say "session started"
+  while [ "$stop" = 0 ] && [ "$(ps -o lstart= -p "$owner" 2>/dev/null)" = "$started" ]; do
+    if ! ssh -S "$sock" -O check -- "$host" >/dev/null 2>&1; then
+      say "tunnel down; reconnecting"
+      if open_master && add_forward "$port" "$server_port"; then
+        say "reconnected"
+        back=1
+        lease=0
+      else
+        sleep "$back"
+        back=$(( back < 30 ? back * 2 : 30 ))
+        continue
+      fi
+    fi
+    now=$(date +%s)
+    if [ $(( now - lease )) -ge 120 ] && mssh "$LEASE" >/dev/null 2>&1; then lease=$now; fi
+    sleep 5
+  done
+  ssh -S "$sock" -O exit -- "$host" >/dev/null 2>&1
+  rm -f "$sock" "$info"
+  say "session ended; tunnel closed"
+  exit 0
+fi
+
+# --- Options -----------------------------------------------------------------------
+opt_profile=""
+opt_vision=""
+opt_hosts=""
+opt_fallback=""
+cmd=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --remote-fast) opt_profile=fast ;;
+    --remote-quality) opt_profile=quality ;;
+    --remote-laguna) opt_profile=laguna ;;
+    --remote-vision) opt_vision=on ;;
+    --remote-no-vision) opt_vision=off ;;
+    --remote-fallback) opt_fallback=on ;;
+    --remote-no-fallback) opt_fallback=off ;;
+    --remote-host=*) opt_hosts=$(printf '%s' "${1#--remote-host=}" | tr ',' ' ') ;;
+    --remote-host) die "use --remote-host=NAME" ;;
+    --remote-status|--remote-start|--remote-disconnect|--remote-help|--remote-set-default)
+      [ -z "$cmd" ] || die "one of --remote-status/start/disconnect/help/set-default at a time"
+      cmd="${1#--remote-}" ;;
+    --remote-*) echo "claude-remote: unknown option '$1' (see claude-remote --remote-help)" >&2; exit 2 ;;
+    --local-*) die "'$1' is a claude-local option; claude-remote's are --remote-* (see claude-remote --remote-help)" ;;
+    *) break ;;
+  esac
+  shift
+done
+
+if [ "$cmd" = "help" ]; then
+  awk 'NR > 1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0"
+  exit 0
+fi
+[ -x "$CLAUDE_LOCAL" ] || die "claude-local not found next to claude-remote or in ~/.local/bin; run install-claude-local.sh (--client-only is enough)"
+
+# Claude Code subcommands (mcp, doctor, ...) need no model: no tunnel.
+if [ -z "$cmd" ] && "$CLAUDE_LOCAL" --local-subcommand "${1:-}" 2>/dev/null; then
+  exec "$CLAUDE_LOCAL" "$@"
+fi
+
+# Saved defaults: host= or hosts=, profile=, vision=, fallback=.
+saved_hosts=""
+saved_profile=""
+saved_vision=""
+saved_fallback=""
+if [ -r "$CONFIG_FILE" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%%#*}
+    key=$(printf '%s' "${line%%=*}" | tr -d '[:space:]')
+    val=$(printf '%s' "${line#*=}" | tr ',' ' ' | awk '{ $1 = $1; print }')
+    case "$key=$val" in
+      "=") ;;
+      host=?*|hosts=?*) saved_hosts=$val ;;
+      profile=fast|profile=quality|profile=laguna) saved_profile=$val ;;
+      vision=on|vision=off) saved_vision=$val ;;
+      fallback=on|fallback=off) saved_fallback=$val ;;
+      *) warn "ignoring '$line' in $CONFIG_FILE" ;;
+    esac
+  done < "$CONFIG_FILE"
+fi
+
+case "${CLAUDE_REMOTE_PROFILE:-}" in ""|fast|quality|laguna) ;; *) die "CLAUDE_REMOTE_PROFILE must be fast, quality or laguna" ;; esac
+case "${CLAUDE_REMOTE_VISION:-}" in ""|on|off) ;; *) die "CLAUDE_REMOTE_VISION must be on or off" ;; esac
+case "${CLAUDE_REMOTE_FALLBACK:-}" in ""|on|off) ;; *) die "CLAUDE_REMOTE_FALLBACK must be on or off" ;; esac
+hosts=${opt_hosts:-${CLAUDE_REMOTE_HOST:-$saved_hosts}}
+hosts=$(printf '%s' "$hosts" | tr ',' ' ')
+profile=${opt_profile:-${CLAUDE_REMOTE_PROFILE:-$saved_profile}}
+vision=${opt_vision:-${CLAUDE_REMOTE_VISION:-$saved_vision}}
+fallback=${opt_fallback:-${CLAUDE_REMOTE_FALLBACK:-${saved_fallback:-off}}}
+for h in $hosts; do
+  valid_host "$h" || die "'$h' is not a valid host name (use an ssh alias, hostname or user@host)"
+done
+
+if [ "$cmd" = "set-default" ]; then
+  [ -n "$opt_hosts$opt_profile$opt_vision$opt_fallback" ] \
+    || die "give --remote-host=NAME, a model, a vision setting and/or --remote-fallback to save"
+  new_hosts=${opt_hosts:-$saved_hosts}
+  new_profile=${opt_profile:-$saved_profile}
+  new_vision=${opt_vision:-$saved_vision}
+  new_fallback=${opt_fallback:-$saved_fallback}
+  mkdir -p "$(dirname "$CONFIG_FILE")"
+  tmp=$(mktemp "$CONFIG_FILE.XXXXXX")
+  {
+    echo "# claude-remote saved defaults (claude-remote --remote-set-default); edit or delete freely"
+    [ -z "$new_hosts" ] || echo "hosts=$new_hosts"
+    [ -z "$new_profile" ] || echo "profile=$new_profile"
+    [ -z "$new_vision" ] || echo "vision=$new_vision"
+    [ -z "$new_fallback" ] || echo "fallback=$new_fallback"
+  } > "$tmp"
+  mv "$tmp" "$CONFIG_FILE"
+  echo "claude-remote: saved defaults to $CONFIG_FILE:"
+  grep -v '^#' "$CONFIG_FILE" | sed 's/^/  /'
+  exit 0
+fi
+
+# The host's claude-local options for the chosen model; empty means its default.
+ropts=""
+[ -z "$profile" ] || ropts="--local-$profile"
+case "$vision" in
+  on) ropts="$ropts --local-vision" ;;
+  off) ropts="$ropts --local-no-vision" ;;
+esac
+
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR"
+
+# --- Status and one-off commands -------------------------------------------------
+if [ "$cmd" = "disconnect" ]; then
+  n=0
+  for f in "$STATE_DIR"/*.info; do
+    [ -f "$f" ] || continue
+    sup=$(sed -n 's/.*supervisor=\([0-9]*\).*/\1/p' "$f")
+    [ -n "$sup" ] && kill -TERM "$sup" 2>/dev/null && n=$((n + 1))
+  done
+  echo "claude-remote: asked $n tunnel(s) to close"
+  exit 0
+fi
+
+if [ "$cmd" = "status" ]; then
+  [ -n "$hosts" ] || echo "hosts:      none set; use claude-remote --remote-host=NAME --remote-set-default"
+  echo "hosts:      ${hosts:-none}$([ -n "$opt_hosts$saved_hosts" ] || [ -z "${CLAUDE_REMOTE_HOST:-}" ] || echo ' (CLAUDE_REMOTE_HOST)')"
+  hd="the host's default"
+  echo "choice:     model ${profile:-$hd}, vision ${vision:-$hd}, fallback $fallback"
+  echo "defaults:   $CONFIG_FILE$([ -r "$CONFIG_FILE" ] || echo ' (none saved)')"
+  echo "tunnels on this Mac:"
+  shown=0
+  for f in "$STATE_DIR"/*.info; do
+    [ -f "$f" ] || continue
+    printf '            %s: %s\n' "$(basename "$f" .info)" "$(cat "$f")"
+    shown=1
+  done
+  [ "$shown" = 1 ] || echo "            none"
+  mine=$(shasum -a 256 "$CLAUDE_LOCAL" | cut -c1-12)
+  for host in $hosts; do
+    echo
+    printf '%s: ' "$host"
+    if ! dssh true 2>/dev/null; then
+      echo "not reachable (asleep, off the network, or SSH not set up)"
+      continue
+    fi
+    echo "reachable"
+    theirs=$(dssh 'shasum -a 256 "$HOME/.local/bin/claude-local" 2>/dev/null | cut -c1-12' 2>/dev/null || true)
+    if [ "$theirs" = "$mine" ]; then
+      echo "  claude-local: same version as this Mac's"
+    else
+      echo "  claude-local: differs from this Mac's (${theirs:-not installed} vs $mine); keep both up to date"
+    fi
+    echo "  keep-awake leases: $(dssh 'pgrep -f "^caffeinate -i -t 301$" | wc -l | tr -d " "' 2>/dev/null || echo '?')"
+    dssh "$remote_cl \"\$b\" $ropts --local-status" 2>&1 | sed 's/^/  /' || true
+  done
+  exit 0
+fi
+
+[ -n "$hosts" ] || die "no host set; run claude-remote --remote-host=NAME --remote-set-default (NAME: an ssh alias, hostname or user@host)"
+
+if [ "$cmd" = "start" ]; then
+  for host in $hosts; do
+    if dssh "$LEASE $remote_cl \"\$b\" $ropts --local-start" 2> >(relabel >&2); then exit 0; fi
+    warn "$host: couldn't load the model (see above); trying the next host, if any"
+  done
+  die "no host could load the model"
+fi
+
+# --- Launch ------------------------------------------------------------------------
+fall_back() {  # fall_back <reason> <Claude Code arguments...>
+  local reason=$1
+  shift
+  if [ "$fallback" = "on" ]; then
+    warn "$reason; using this Mac's own model instead (claude-local)"
+    [ -z "$profile" ] || set -- "--local-$profile" "$@"
+    exec "$CLAUDE_LOCAL" "$@"
+  fi
+  die "$reason. Wake it or check the network, use claude-local for this Mac's own model, or add --remote-fallback."
+}
+
+host=""
+for h in $hosts; do
+  set_paths "$h" "$$"
+  host=$h
+  if open_master; then break; fi
+  warn "$h is not reachable (asleep, off the network, or SSH not set up)"
+  host=""
+done
+[ -n "$host" ] || fall_back "no host answered ($hosts)" "$@"
+# Until the supervisor takes over, close the tunnel if this launch stops.
+trap 'ssh -S "$sock" -O exit -- "$host" >/dev/null 2>&1; rm -f "$sock"' EXIT
+
+# Start (or reuse) the model on the host, then ask it what a session uses.
+out=$(mssh "$LEASE $remote_cl \"\$b\" $ropts --local-start >&2 && exec \"\$b\" $ropts --local-resolve" \
+  2> >(relabel >&2)) || rc=$?
+rc=${rc:-0}
+kv=$(printf '%s\n' "$out" | sed -n '/^claude-local-resolve 1$/,$p' | sed 1d)
+if [ -z "$kv" ]; then
+  case "$rc" in
+    2) die "claude-local on $host is older than claude-remote needs; update it there (re-run install-claude-local.sh)" ;;
+    3) die "claude-local is not installed on $host; install it there first" ;;
+    *) die "$host couldn't start the model (see its messages above)" ;;
+  esac
+fi
+r_class="" r_profile="" r_vision="" r_model="" r_ctx="" r_out="" r_caps="" r_has="" r_fast="" r_lean="" r_port=""
+while IFS= read -r line; do
+  k=${line%%=*}
+  v=${line#*=}
+  case "$k" in
+    class) r_class=$v ;;
+    profile) r_profile=$v ;;
+    vision) r_vision=$v ;;
+    model) r_model=$v ;;
+    ctx) r_ctx=$v ;;
+    max_out) r_out=$v ;;
+    caps) r_caps=$v ;;
+    has_vision) r_has=$v ;;
+    fast_vision) r_fast=$v ;;
+    lean) r_lean=$v ;;
+    server_port) r_port=$v ;;
+  esac
+done <<EOF
+$kv
+EOF
+for v in "$r_ctx" "$r_out" "$r_port"; do
+  case "$v" in ""|*[!0-9]*) die "$host sent an unexpected answer; check claude-local there" ;; esac
+done
+case "$r_model" in ""|*[!A-Za-z0-9._-]*) die "$host sent an unexpected model name" ;; esac
+case "$r_caps" in *[!A-Za-z0-9_,-]*) die "$host sent unexpected model settings" ;; esac
+case "$r_profile:$r_vision:$r_has:$r_fast:$r_lean" in
+  fast:*|quality:*|laguna:*) ;;
+  *) die "$host sent an unexpected answer; check claude-local there" ;;
+esac
+
+# Forward a free local port to the host's server.
+port=""
+p=$PORT_FIRST
+while [ "$p" -le "$PORT_LAST" ]; do
+  if ! port_in_use "$p" && add_forward "$p" "$r_port"; then port=$p; break; fi
+  p=$((p + 1))
+done
+[ -n "$port" ] || die "no free local port between $PORT_FIRST and $PORT_LAST for the tunnel"
+
+# Hand the tunnel to a supervisor in its own process group. This process
+# keeps its pid through the exec into claude-local and then Claude Code, so
+# the supervisor can tell when the session ends.
+( set -m; nohup "$0" --remote-supervise "$$" "$host" "$port" "$r_port" "$$" </dev/null >>"$log" 2>&1 & )
+trap - EXIT
+
+export CLAUDE_LOCAL_REMOTE="$host" CLAUDE_LOCAL_REMOTE_PORT="$port" CLAUDE_LOCAL_REMOTE_MODEL="$r_model"
+export CLAUDE_LOCAL_REMOTE_CTX="$r_ctx" CLAUDE_LOCAL_REMOTE_MAX_OUT="$r_out" CLAUDE_LOCAL_REMOTE_CAPS="$r_caps"
+export CLAUDE_LOCAL_REMOTE_PROFILE="$r_profile" CLAUDE_LOCAL_REMOTE_VISION="$r_vision"
+export CLAUDE_LOCAL_REMOTE_HAS_VISION="$r_has" CLAUDE_LOCAL_REMOTE_FAST_VISION="$r_fast"
+export CLAUDE_LOCAL_REMOTE_LEAN="$r_lean" CLAUDE_LOCAL_REMOTE_CLASS="$r_class"
+exec "$CLAUDE_LOCAL" "$@"

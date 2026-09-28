@@ -1,6 +1,6 @@
 # local-models
 
-`claude-local` runs Claude Code against a local open-weight model on an Apple Silicon Mac, served by oMLX. The normal `claude` command, its login, settings and history are unaffected, and the install needs no admin rights.
+`claude-local` runs Claude Code against a local open-weight model on an Apple Silicon Mac, served by oMLX. `claude-remote` does the same with the model served by another Mac over SSH, for example a Mac Studio (see [below](#use-a-model-on-another-mac-claude-remote)). The normal `claude` command, its login, settings and history are unaffected, and the install needs no admin rights.
 
 It picks models for the Mac's memory. Each Mac has up to three models:
 - **fast:** Qwen, a mixture-of-experts model; the default on the MacBooks.
@@ -35,6 +35,7 @@ cd local-models
 | `./install-claude-local.sh --with-laguna` | Also Laguna on a 36 GB Mac (20 GB) |
 | `./install-claude-local.sh --with-all` | Every model this Mac can run |
 | `./install-claude-local.sh --memory-test` | Also test every installed model at its full window, stepping down until one fits, and record the result for this Mac |
+| `./install-claude-local.sh --client-only` | Only the wrappers and the Claude Code profile, for a Mac that uses models on another Mac with `claude-remote` |
 
 The script is safe to re-run. [INSTALL.md](INSTALL.md) has the same steps done by hand, a sizing guide, troubleshooting and updating. On a Mac whose windows are estimates, run `--memory-test` once.
 
@@ -97,6 +98,7 @@ The first launch starts the server and loads the model: 10–15 s for the Qwen m
 | Models | Under `~/.omlx/models/`, one folder per model; see `claude-local --local-status`. Each Qwen model has a `-vision` symlink served by oMLX's vision engine. |
 | Saved defaults | `~/.config/claude-local/defaults` (or `$XDG_CONFIG_HOME/claude-local/defaults` if you set that), only after `--local-set-default` |
 | Windows measured on this Mac | `~/.config/claude-local/windows`, written by `--memory-test` only where they differ from the built-in ones |
+| Remote wrapper | `~/.local/bin/claude-remote`; its saved host and model in `~/.config/claude-local/remote`; tunnel sockets and a log per host in `~/.claude-local/remote/` |
 | Prompt cache and logs | `~/.omlx/cache` (capped at 20 GB on 16 GB Macs, 50 GB on 36 GB, 300 GB on the Studios), `~/.omlx/logs/claude-local-server.log` |
 
 The install uses no admin rights and changes nothing in `~/.claude`, `~/.claude.json`, shell startup files or launchd.
@@ -154,6 +156,53 @@ How `claude-local` runs it, and what to know:
 - **Speculative decoding (DFlash)** is off. oMLX supports it for Laguna, but it is slower than normal decoding at Claude Code's prompt lengths.
 - **Thinking** is on, with no effort control. Poolside lists overthinking as a known limitation, and output is capped at 32K tokens per reply.
 - **Harness fit:** Poolside notes that the model is tuned to its own agent harness and can struggle with other harnesses' tool definitions at first. Try it on real tasks next to the Qwen models before relying on it.
+
+## Use a model on another Mac (`claude-remote`)
+
+`claude-remote` runs Claude Code on this Mac against a model served by another Mac's `claude-local` install, the host. The host's memory and GPU do the inference. Claude Code, its profile (`~/.claude-local`, shared with `claude-local`) and the org-managed settings stay on this Mac. It works with any host, not just a particular one.
+
+**Set up**
+- **The host:** the full install (`./install-claude-local.sh`, with the models you want), and Remote Login on, which needs an admin once, in System Settings > General > Sharing.
+- **This Mac:** either install. `--client-only` is enough on a Mac that never runs models itself. Also key-based SSH to the host: `ssh <host> true` must work without a password prompt.
+- **Choose the host once:** an ssh alias from `~/.ssh/config`, a hostname or `user@host`; a list is tried in order:
+
+```sh
+claude-remote --remote-host=mstudio --remote-set-default
+claude-remote --remote-status
+```
+
+**Use**
+
+| Command | What it does |
+|---|---|
+| `claude-remote` | A session with the host's default model (Laguna S on a Mac Studio); same flags as claude |
+| `claude-remote --remote-fast`, `--remote-quality`, `--remote-laguna` | Choose the model; the host's catalog and measured windows apply |
+| `claude-remote --remote-fast --remote-vision` | Image input, if the host's model has it |
+| `claude-remote --remote-host=NAME` | Another host for this launch; `"mstudio m4max"` tries them in order |
+| `claude-remote --remote-fallback` | If no host answers, use this Mac's own model instead of stopping |
+| `claude-remote --remote-status` | Hosts, this Mac's tunnels, and each host's models and server |
+| `claude-remote --remote-start` | Load the model on the host ahead of time |
+| `claude-remote --remote-disconnect` | Close this Mac's tunnels |
+
+`CLAUDE_REMOTE_HOST`, `CLAUDE_REMOTE_PROFILE`, `CLAUDE_REMOTE_VISION` and `CLAUDE_REMOTE_FALLBACK` do the same per command or shell.
+
+**Measured**, from this MacBook Pro to the Mac Studio over the corporate network:
+- An HTTP round trip through the tunnel took about 205 ms.
+- In the agentic test (INSTALL.md step 8e), Laguna S took 4 turns and 51 s, the fast model 4 turns and 24 s, and the quality model 7 turns and 89 s. That matches running on the Studio itself, so the tunnel adds little.
+
+**How it works**
+- **The tunnel:** each session opens its own SSH tunnel from a free local port (18765–18799) to the host's oMLX, which stays bound to the host's own 127.0.0.1. Nothing new is exposed on the network.
+- **The host's model:** the host's own `claude-local` starts its server if needed, loads the model and reports the model, window and settings to use.
+- **A supervisor** runs alongside each session:
+  - it reconnects the tunnel if it drops; in testing, a killed connection came back in about 1 s and Claude Code's retry finished the reply;
+  - it keeps the host from idle-sleeping with 5-minute keep-awake leases, renewed every 2 minutes, one lease per host however many sessions;
+  - it closes the tunnel when the session ends. Once nothing renews the lease, the host sleeps again normally.
+
+**Limits**
+- **An asleep host can't be woken this way.** `claude-remote` stops with a message within a few seconds, or with `--remote-fallback` uses this Mac's own model. Setting the host's Energy option "Prevent automatic sleeping when the display is off" avoids this.
+- **A dropped network link:** if the link drops without the connection closing, a request already running on the host can hold its single request slot until the host's SSH server notices. `ClientAliveInterval 15` in the host's sshd settings (an admin change) shortens that.
+- **Shared server:** sessions on the host itself share its server with remote ones: one request at a time, and a model switch by one swaps it out for the others (both wrappers warn).
+- **Resuming a session with a different wrapper:** a session started with `claude-remote` and resumed with `claude-local` gets this Mac's (usually smaller) window.
 
 ## Compared with `ollama launch claude`
 
@@ -218,7 +267,7 @@ To compare properly, run the same 5–10 real tasks through Pi, Qwen Code and a 
 
 ## Privacy note
 
-Inference is local, but any organization-managed Claude Code settings still apply. On Marlin Macs, the MintMCP hooks and OTEL telemetry send prompts and tool events off the machine, exactly as with normal `claude`.
+Inference is local, but any organization-managed Claude Code settings still apply. On Marlin Macs, the MintMCP hooks and OTEL telemetry send prompts and tool events off the machine, exactly as with normal `claude`. With `claude-remote`, prompts and code also travel to the host over SSH and are kept in its prompt cache on disk (up to 300 GB on a Studio).
 
 ## Overrides
 
@@ -235,9 +284,11 @@ For experiments, set these per invocation, for example `CLAUDE_LOCAL_CTX=65536 c
 ## Uninstall
 
 ```sh
+claude-remote --remote-disconnect
 claude-local --local-stop
-rm -f ~/.local/bin/claude-local
+rm -f ~/.local/bin/claude-local ~/.local/bin/claude-remote
 find ~/.local/bin -name 'claude-local.bak-*' -delete
+find ~/.local/bin -name 'claude-remote.bak-*' -delete
 rm -rf ~/.claude-local ~/.omlx ~/Applications/oMLX.app ~/Downloads/omlx ~/claude-local-baseline
 rm -rf "${XDG_CONFIG_HOME:-$HOME/.config}/claude-local"
 ```
@@ -251,8 +302,9 @@ If oMLX was set up on the Mac before `claude-local`, keep `~/.omlx` and restore 
 | `install-claude-local.sh` | The installer. **Generated.** |
 | `INSTALL.md` | The manual install guide. **Generated.** |
 | `src/claude-local` | The wrapper that the installer puts in `~/.local/bin`. Its `catalog` table lists every model for every class of Mac. |
+| `src/claude-remote` | The remote wrapper: tunnel, supervisor and host handshake, then it runs `claude-local` in remote mode |
 | `src/model_settings.json` | oMLX per-model settings for every model and vision variant |
 | `src/INSTALL.md.in`, `src/install-claude-local.sh.in` | Templates for the generated files |
 | `scripts/build.py` | Regenerates the generated files from `src/` |
 
-The generated files embed the wrapper and model settings verbatim, so edit `src/` and run `python3 scripts/build.py` rather than editing them directly. The build also checks that every model in the catalog has oMLX settings. `python3 scripts/build.py --check` fails if the generated files are out of date.
+The generated files embed the wrappers and model settings verbatim, so edit `src/` and run `python3 scripts/build.py` rather than editing them directly. The build also checks that every model in the catalog has oMLX settings. `python3 scripts/build.py --check` fails if the generated files are out of date.

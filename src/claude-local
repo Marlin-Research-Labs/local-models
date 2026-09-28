@@ -26,7 +26,8 @@
 #   --local-start         start the server and load the selected model, then exit
 #   --local-stop          stop the oMLX server started by claude-local
 #   --local-help          show this help
-# The default model is fast, or laguna on Macs with 96 GB or more.
+# The default model is fast, or laguna on Macs with 96 GB or more. To use a
+# model served by another Mac, see claude-remote.
 #
 # Environment, per invocation: CLAUDE_LOCAL_PROFILE=fast|quality|laguna and
 # CLAUDE_LOCAL_VISION=on|off. For experiments: CLAUDE_LOCAL_MODEL (served model
@@ -48,7 +49,6 @@ die() { echo "claude-local: $*" >&2; exit 1; }
 # Native installer symlink (follows updates); fall back to whatever claude is on PATH.
 CLAUDE_BIN="$HOME/.local/bin/claude"
 [ -x "$CLAUDE_BIN" ] || CLAUDE_BIN="$(command -v claude || true)"
-[ -n "$CLAUDE_BIN" ] || die "Claude Code not found (expected ~/.local/bin/claude)"
 
 # oMLX.app in ~/Applications (no admin needed), else /Applications.
 OMLX_APP="$HOME/Applications/oMLX.app"
@@ -59,6 +59,110 @@ OMLX_LOG="$OMLX_HOME/logs/claude-local-server.log"
 LOCAL_CONFIG_DIR="$HOME/.claude-local"
 DEFAULTS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-local/defaults"
 WINDOWS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-local/windows"
+# How to relaunch, for messages: claude-local, or claude-remote in remote mode.
+me=claude-local
+px=--local-
+where="this Mac"
+
+# Claude Code subcommands (mcp, doctor, update, ...) take no session flags
+# and need no model.
+is_subcommand() {
+  case "${1:-}" in
+    agents|attach|auth|auto-mode|doctor|gateway|import|install|logs|mcp|plugin|plugins|project|respawn|rm|setup-token|stop|kill|ultrareview|update|upgrade) return 0 ;;
+  esac
+  return 1
+}
+
+# True when the backend answers and lists $model.
+server_has_model() {
+  curl -fsS -m 3 -H "Authorization: Bearer $token" "$base_url/v1/models" 2>/dev/null \
+    | /usr/bin/jq -e --arg m "$model" 'any(.data[]?; .id == $m)' >/dev/null 2>&1
+}
+
+# Launch Claude Code against the chosen model; used by both local and remote
+# sessions. Needs: model, base_url, token, ctx, max_out, caps, lean, vision,
+# has_vision, fast_vision, me and px.
+launch_claude() {
+  [ -n "$CLAUDE_BIN" ] || die "Claude Code not found (expected ~/.local/bin/claude)"
+  [ -d "$LOCAL_CONFIG_DIR" ] || mkdir -p "$LOCAL_CONFIG_DIR"
+
+  # Drop anything that could route or authenticate elsewhere.
+  unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_PROFILE ANTHROPIC_BETAS \
+    ANTHROPIC_SMALL_FAST_MODEL CLAUDE_CODE_SIMPLE CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX \
+    CLAUDE_CODE_USE_FOUNDRY CLAUDE_CODE_USE_MANTLE CLAUDE_CODE_USE_GATEWAY \
+    CLAUDE_CODE_USE_ANTHROPIC_AWS CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD \
+    CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT \
+    CLAUDE_CODE_AUTO_COMPACT_WINDOW CLAUDE_SECURESTORAGE_CONFIG_DIR CLAUDE_CODE_MODEL_CAPABILITIES
+
+  # Isolated profile and local endpoint.
+  export CLAUDE_CONFIG_DIR="$LOCAL_CONFIG_DIR"
+  export ANTHROPIC_BASE_URL="$base_url"
+  export ANTHROPIC_AUTH_TOKEN="$token"
+
+  # Every model tier maps to the one loaded model.
+  export ANTHROPIC_MODEL="$model" CLAUDE_CODE_SUBAGENT_MODEL="$model"
+  export ANTHROPIC_DEFAULT_FABLE_MODEL="$model" ANTHROPIC_DEFAULT_OPUS_MODEL="$model"
+  export ANTHROPIC_DEFAULT_SONNET_MODEL="$model" ANTHROPIC_DEFAULT_HAIKU_MODEL="$model"
+
+  # Context: Claude Code assumes 200K for unknown models; declare the real window.
+  export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$ctx" CLAUDE_CODE_MAX_OUTPUT_TOKENS="$max_out"
+
+  # Keep the prompt prefix stable so the server's prefix cache hits.
+  export CLAUDE_CODE_ATTRIBUTION_HEADER=0 CLAUDE_CODE_TOTAL_TOKENS_REMINDER=off
+
+  # Most of these models' chat templates reject system messages after the first
+  # one, and oMLX then moves them to the front, which breaks the prefix cache.
+  [ -z "$caps" ] || export CLAUDE_CODE_MODEL_CAPABILITIES="$caps"
+
+  # Compatibility with a non-Anthropic backend.
+  export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1 ENABLE_CLAUDEAI_MCP_SERVERS=false
+  export CLAUDE_CODE_DISABLE_FAST_MODE=1 CLAUDE_CODE_AUTO_MODE_SERVER=0
+  export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+
+  # One server slot: no background side requests or parallel subagents.
+  export CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=1 CLAUDE_CODE_ENABLE_AWAY_SUMMARY=0
+  export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false
+  export CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1
+
+  # Local prefill of long prompts can take minutes.
+  export API_TIMEOUT_MS=3000000 CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS=1800000
+  export CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS=600000
+
+  is_subcommand "${1:-}" && exec "$CLAUDE_BIN" "$@"
+
+  # Lean: a smaller tool set cuts Claude Code's prompt from ~16K to ~4.5K
+  # tokens, which a slow Mac needs minutes to process on every cache miss.
+  if [ "$lean" = "on" ]; then
+    set -- --tools=Read,Edit,Write,Bash,Grep,Glob --disable-slash-commands "$@"
+  fi
+
+  # Without vision the server drops images silently. A hook on the Read tool
+  # refuses image files with a clear message instead. (Deny rules would also
+  # hide image files from Glob and Grep.) The reason must not contain a quote.
+  if [ "$vision" = "off" ]; then
+    if [ "$has_vision" = "yes" ]; then
+      how="Tell the user to relaunch with $me ${px}vision."
+    elif [ "$fast_vision" = "yes" ]; then
+      how="This model has no image input; tell the user to relaunch with $me ${px}fast ${px}vision."
+    else
+      how="No model on $where has image input."
+    fi
+    reason="Image input is off in this $me session, so image files cannot be viewed. There is no workaround: do not try to decode, OCR or convert images with shell commands or scripts. $how"
+    deny=$(/usr/bin/jq -cn --arg r "$reason" \
+      '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $r}}')
+    image_hook="/usr/bin/jq -r '.tool_input.file_path // empty' | /usr/bin/grep -qiE '[.](png|jpe?g|gif|webp)\$' || exit 0
+printf '%s\n' '$deny'"
+    hook_settings=$(/usr/bin/jq -cn --arg c "$image_hook" \
+      '{hooks: {PreToolUse: [{matcher: "Read", hooks: [{type: "command", command: $c}]}]}}')
+    set -- "--settings=$hook_settings" "$@"
+  fi
+
+  # WebSearch is an Anthropic server-side tool; LSP schema changes break the
+  # prefix cache.
+  exec "$CLAUDE_BIN" --strict-mcp-config --exclude-dynamic-system-prompt-sections \
+    --disallowedTools=WebSearch,LSP "$@"
+}
+
 
 # --- Wrapper options: a leading run of --local-* arguments ------------------
 opt_profile=""
@@ -71,9 +175,10 @@ while [ $# -gt 0 ]; do
     --local-laguna) opt_profile=laguna ;;
     --local-vision) opt_vision=on ;;
     --local-no-vision) opt_vision=off ;;
-    --local-status|--local-start|--local-stop|--local-help|--local-set-default|--local-catalog)
+    --local-status|--local-start|--local-stop|--local-help|--local-set-default|--local-catalog|--local-resolve)
       [ -z "$cmd" ] || die "one of --local-status/start/stop/help/set-default at a time"
       cmd="${1#--local-}" ;;
+    --local-subcommand) cmd=subcommand; shift; break ;;
     --local-*) echo "claude-local: unknown option '$1' (see claude-local --local-help)" >&2; exit 2 ;;
     *) break ;;
   esac
@@ -83,6 +188,48 @@ done
 if [ "$cmd" = "help" ]; then
   awk 'NR > 1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0"
   exit 0
+fi
+
+# For claude-remote: is this argument a Claude Code subcommand?
+if [ "$cmd" = "subcommand" ]; then
+  if is_subcommand "${1:-}"; then exit 0; else exit 1; fi
+fi
+
+# --- Remote mode: started by claude-remote, model served by another Mac ------
+# claude-remote has opened an SSH tunnel to the host and asked the host's own
+# claude-local which model and window to use (--local-resolve). Nothing here
+# looks at this Mac's models or starts a local server.
+if [ -n "${CLAUDE_LOCAL_REMOTE:-}" ]; then
+  me=claude-remote
+  px=--remote-
+  where=$CLAUDE_LOCAL_REMOTE
+  [ -z "$cmd" ] || die "--local-$cmd doesn't apply to claude-remote sessions; see claude-remote --remote-help"
+  host=$CLAUDE_LOCAL_REMOTE
+  port=${CLAUDE_LOCAL_REMOTE_PORT:-}
+  model=${CLAUDE_LOCAL_REMOTE_MODEL:-}
+  profile=${CLAUDE_LOCAL_REMOTE_PROFILE:-}
+  vision=${CLAUDE_LOCAL_REMOTE_VISION:-off}
+  ctx=${CLAUDE_LOCAL_CTX:-${CLAUDE_LOCAL_REMOTE_CTX:-}}
+  max_out=${CLAUDE_LOCAL_MAX_OUT:-${CLAUDE_LOCAL_REMOTE_MAX_OUT:-}}
+  caps=${CLAUDE_LOCAL_REMOTE_CAPS-}
+  has_vision=${CLAUDE_LOCAL_REMOTE_HAS_VISION:-no}
+  fast_vision=${CLAUDE_LOCAL_REMOTE_FAST_VISION:-no}
+  case "${CLAUDE_LOCAL_LEAN:-${CLAUDE_LOCAL_REMOTE_LEAN:-off}}" in
+    on|1|yes|true) lean=on ;;
+    *) lean=off ;;
+  esac
+  for v in "$port" "$ctx" "$max_out"; do
+    case "$v" in ""|*[!0-9]*) die "internal error: claude-remote passed a bad port, window or output cap" ;; esac
+  done
+  case "$model" in ""|*[!A-Za-z0-9._-]*) die "internal error: claude-remote passed a bad model name" ;; esac
+  token="local"
+  base_url="http://127.0.0.1:$port"
+  if ! is_subcommand "${1:-}"; then
+    server_has_model \
+      || die "the model server on $host isn't answering through the tunnel (127.0.0.1:$port); try claude-remote --remote-status"
+    [ -t 2 ] && echo "claude-remote: $profile, vision $vision -> $model on $host, context $ctx" >&2
+  fi
+  launch_claude "$@"
 fi
 
 # --- This Mac's memory class ------------------------------------------------
@@ -288,6 +435,8 @@ if [ "$cmd" = "set-default" ]; then
   exit 0
 fi
 
+catalog fast
+if [ -n "$vision_ctx" ]; then fast_vision=yes; else fast_vision=no; fi
 profile_row "$profile" "$vision"
 # A model without image input: an explicit --local-vision is an error; a
 # saved or environment vision=on is set aside for this model.
@@ -333,12 +482,6 @@ if [ "$port" = "8765" ]; then OMLX_PIDFILE="$OMLX_HOME/claude-local-server.pid"
 else OMLX_PIDFILE="$OMLX_HOME/claude-local-server-$port.pid"; fi
 
 # --- Server helpers ----------------------------------------------------------
-# True when the backend answers and lists $model.
-server_has_model() {
-  curl -fsS -m 3 -H "Authorization: Bearer $token" "$base_url/v1/models" 2>/dev/null \
-    | /usr/bin/jq -e --arg m "$model" 'any(.data[]?; .id == $m)' >/dev/null 2>&1
-}
-
 port_listener_pid() {
   lsof -nP -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null | head -1 || true
 }
@@ -400,15 +543,6 @@ swap_warning() {
 $(loaded_models)
 EOF
   return 0
-}
-
-# Claude Code subcommands (mcp, doctor, update, ...) take no session flags
-# and need no model.
-is_subcommand() {
-  case "${1:-}" in
-    agents|attach|auth|auto-mode|doctor|gateway|import|install|logs|mcp|plugin|plugins|project|respawn|rm|setup-token|stop|kill|ultrareview|update|upgrade) return 0 ;;
-  esac
-  return 1
 }
 
 start_omlx() {
@@ -554,9 +688,25 @@ case "$cmd" in
     memory_warnings
     ensure_server
     swap_warning
-    echo "claude-local: loading '$model'..." >&2
-    warm_model || die "the model failed to load; see $OMLX_LOG"
+    # Don't queue a warm-up behind another session's generation.
+    if loaded_models | awk -v m="$model" '$1 == m { found = 1 } END { exit !found }' \
+       && [ "$(requests_in_flight)" != "0" ]; then
+      echo "claude-local: '$model' is loaded and busy with another request" >&2
+    else
+      echo "claude-local: loading '$model'..." >&2
+      warm_model || die "the model failed to load; see $OMLX_LOG"
+    fi
     echo "claude-local: ready at $base_url ($profile, vision $vision)"
+    exit 0
+    ;;
+  resolve)
+    # For claude-remote on another Mac: the model and settings a session here
+    # would use. A sentinel line first, then key=value lines.
+    if [ -n "$vision_ctx" ]; then has_vision=yes; else has_vision=no; fi
+    echo "claude-local-resolve 1"
+    printf '%s=%s\n' class "$class" profile "$profile" vision "$vision" model "$model" ctx "$ctx" \
+      max_out "$max_out" caps "$caps" has_vision "$has_vision" fast_vision "$fast_vision" lean "$lean" \
+      server_port "$port"
     exit 0
     ;;
 esac
@@ -568,83 +718,6 @@ if ! is_subcommand "${1:-}"; then
   [ -t 2 ] && echo "claude-local: $profile, vision $vision -> $model, context $ctx" >&2
 fi
 
-[ -d "$LOCAL_CONFIG_DIR" ] || mkdir -p "$LOCAL_CONFIG_DIR"
-
-# Drop anything that could route or authenticate elsewhere.
-unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_PROFILE ANTHROPIC_BETAS \
-  ANTHROPIC_SMALL_FAST_MODEL CLAUDE_CODE_SIMPLE CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX \
-  CLAUDE_CODE_USE_FOUNDRY CLAUDE_CODE_USE_MANTLE CLAUDE_CODE_USE_GATEWAY \
-  CLAUDE_CODE_USE_ANTHROPIC_AWS CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD \
-  CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT \
-  CLAUDE_CODE_AUTO_COMPACT_WINDOW CLAUDE_SECURESTORAGE_CONFIG_DIR CLAUDE_CODE_MODEL_CAPABILITIES
-
-# Isolated profile and local endpoint.
-export CLAUDE_CONFIG_DIR="$LOCAL_CONFIG_DIR"
-export ANTHROPIC_BASE_URL="$base_url"
-export ANTHROPIC_AUTH_TOKEN="$token"
-
-# Every model tier maps to the one loaded model.
-export ANTHROPIC_MODEL="$model" CLAUDE_CODE_SUBAGENT_MODEL="$model"
-export ANTHROPIC_DEFAULT_FABLE_MODEL="$model" ANTHROPIC_DEFAULT_OPUS_MODEL="$model"
-export ANTHROPIC_DEFAULT_SONNET_MODEL="$model" ANTHROPIC_DEFAULT_HAIKU_MODEL="$model"
-
-# Context: Claude Code assumes 200K for unknown models; declare the real window.
-export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$ctx" CLAUDE_CODE_MAX_OUTPUT_TOKENS="$max_out"
-
-# Keep the prompt prefix stable so the server's prefix cache hits.
-export CLAUDE_CODE_ATTRIBUTION_HEADER=0 CLAUDE_CODE_TOTAL_TOKENS_REMINDER=off
-
-# Most of these models' chat templates reject system messages after the first
-# one, and oMLX then moves them to the front, which breaks the prefix cache.
-[ -z "$caps" ] || export CLAUDE_CODE_MODEL_CAPABILITIES="$caps"
-
-# Compatibility with a non-Anthropic backend.
-export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1 ENABLE_CLAUDEAI_MCP_SERVERS=false
-export CLAUDE_CODE_DISABLE_FAST_MODE=1 CLAUDE_CODE_AUTO_MODE_SERVER=0
-export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
-
-# One server slot: no background side requests or parallel subagents.
-export CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=1 CLAUDE_CODE_ENABLE_AWAY_SUMMARY=0
-export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false
-export CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1
-
-# Local prefill of long prompts can take minutes.
-export API_TIMEOUT_MS=3000000 CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS=1800000
-export CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS=600000
-
-is_subcommand "${1:-}" && exec "$CLAUDE_BIN" "$@"
-
-# Lean: a smaller tool set cuts Claude Code's prompt from ~16K to ~4.5K
-# tokens, which a slow Mac needs minutes to process on every cache miss.
-if [ "$lean" = "on" ]; then
-  set -- --tools=Read,Edit,Write,Bash,Grep,Glob --disable-slash-commands "$@"
-fi
-
-# Without vision the server drops images silently. A hook on the Read tool
-# refuses image files with a clear message instead. (Deny rules would also
-# hide image files from Glob and Grep.) The reason must not contain a quote.
-if [ "$vision" = "off" ]; then
-  if [ -n "$vision_ctx" ]; then
-    how="Tell the user to relaunch with claude-local --local-vision."
-  else
-    catalog fast
-    if [ -n "$vision_ctx" ]; then
-      how="This model has no image input; tell the user to relaunch with claude-local --local-fast --local-vision."
-    else
-      how="No model on this Mac has image input."
-    fi
-  fi
-  reason="Image input is off in this claude-local session, so image files cannot be viewed. There is no workaround: do not try to decode, OCR or convert images with shell commands or scripts. $how"
-  deny=$(/usr/bin/jq -cn --arg r "$reason" \
-    '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $r}}')
-  image_hook="/usr/bin/jq -r '.tool_input.file_path // empty' | /usr/bin/grep -qiE '[.](png|jpe?g|gif|webp)\$' || exit 0
-printf '%s\n' '$deny'"
-  hook_settings=$(/usr/bin/jq -cn --arg c "$image_hook" \
-    '{hooks: {PreToolUse: [{matcher: "Read", hooks: [{type: "command", command: $c}]}]}}')
-  set -- "--settings=$hook_settings" "$@"
-fi
-
-# WebSearch is an Anthropic server-side tool; LSP schema changes break the
-# prefix cache.
-exec "$CLAUDE_BIN" --strict-mcp-config --exclude-dynamic-system-prompt-sections \
-  --disallowedTools=WebSearch,LSP "$@"
+# The vision hook's advice depends on the model and on the Mac's fast model.
+if [ -n "$vision_ctx" ]; then has_vision=yes; else has_vision=no; fi
+launch_claude "$@"
